@@ -1,0 +1,18 @@
+# ============ Keil build artifacts / local user files ============
+OBJ/
+Listings/
+*.uvgui.*
+*.uvopt
+*.uvoptx
+*.dep
+*.bak
+*.crf
+*.o
+*.axf
+*.d
+*.lst
+JLinkSettings.ini
+
+# ============ Temporary full FreeRTOS source package ============
+# Only used to extract files into RTOS/FreeRTOS-Kernel; will be removed later.
+FreeRTOSv202406.04-LTS/
