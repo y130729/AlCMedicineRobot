@@ -62,7 +62,10 @@ static u8 LINE_IsBlack(u16 adc_value)
 }
 
 /* ==================== WiFi 遥控命令处理 ==================== */
-static u8 handle_wifi_command(char *pMsgBuff, u16 *pwmval)
+/* 遥控命令: 手动控制(forward/backward/left/right/stop/speed) 与任务控制
+ * (startTask/stopTask)。startTask 使能循迹, stopTask 停止循迹并刹停。
+ * 返回 1 表示命令被识别执行, 返回 0 表示未识别。 */
+static u8 handle_wifi_command(char *pMsgBuff, u16 *pwmval, u8 *line_enabled)
 {
 	if (pMsgBuff == 0) return 0;
 
@@ -88,7 +91,39 @@ static u8 handle_wifi_command(char *pMsgBuff, u16 *pwmval)
 		else *pwmval = 50;
 		return 1;
 	}
+	if (strstr((const char*)pMsgBuff, (const char*)"startTask"))
+	{
+		*line_enabled = 1;
+		return 1;
+	}
+	if (strstr((const char*)pMsgBuff, (const char*)"stopTask"))
+	{
+		*line_enabled = 0;
+		MOTOR_Stop();
+		return 1;
+	}
 	return 0;
+}
+
+/* ---- 命令串拆分执行 ----
+ * 上位机每条命令以 \r\n 结尾; 当按键按下与松开间隔小于 100ms 时, 多条命令
+ * 会合并进同一帧(例如 "forWard\r\nletStop\r\n")。这里按行拆分后逐条执行,
+ * 避免快速按键时只执行第一条命令导致小车无法停止。 */
+static u8 wifi_dispatch_commands(char *pBuf, u16 *pwmval, u8 *line_enabled)
+{
+	char *token;
+	u8 handled = 0;
+
+	if (pBuf == 0) return 0;
+
+	token = strtok(pBuf, "\r\n");
+	while (token)
+	{
+		if (*token != 0)
+			handled |= handle_wifi_command(token, pwmval, line_enabled);
+		token = strtok(0, "\r\n");
+	}
+	return handled;
 }
 
 /* ==================== 循迹主循环(整合WiFi/JPEG) ==================== */
@@ -105,6 +140,7 @@ typedef struct
 	u8  camera_occlusion_active;
 	s8  last_direction;
 	u16 pwmval;
+	u8  line_enabled;
 	u8  wifi_override;
 	u32 wifi_override_end;
 } CAR_Ctx;
@@ -120,6 +156,7 @@ static void CAR_CtxInit(CAR_Ctx *ctx)
 	ctx->camera_occlusion_active = 0;
 	ctx->last_direction = 0;
 	ctx->pwmval = 300;
+	ctx->line_enabled = 0;
 	ctx->wifi_override = 0;
 	ctx->wifi_override_end = 0;
 }
@@ -137,7 +174,7 @@ static void CAR_StepWifi(CAR_Ctx *ctx)
 	if (RTOS_WifiCmdReceive(&msg))
 	{
 		pMsgBuff = msg.cmd;
-		if (handle_wifi_command(pMsgBuff, &ctx->pwmval))
+		if (wifi_dispatch_commands(pMsgBuff, &ctx->pwmval, &ctx->line_enabled))
 		{
 			ctx->wifi_override = 1;
 			ctx->wifi_override_end = ctx->now_ms + 500;
@@ -147,7 +184,7 @@ static void CAR_StepWifi(CAR_Ctx *ctx)
 	pMsgBuff = atk_8266_at_response_rdCmd(1);
 	if (pMsgBuff)
 	{
-		if (handle_wifi_command(pMsgBuff, &ctx->pwmval))
+		if (wifi_dispatch_commands(pMsgBuff, &ctx->pwmval, &ctx->line_enabled))
 		{
 			ctx->wifi_override = 1;
 			ctx->wifi_override_end = ctx->now_ms + 500;
@@ -269,8 +306,15 @@ static void CAR_StepMotion(CAR_Ctx *ctx)
 {
 	if (ctx->obstacle_active || ctx->camera_occlusion_active || ctx->wifi_override)
 	{
-		if (ctx->obstacle_active || ctx->camera_occlusion_active)
+		if (ctx->obstacle_active || ctx->camera_occlusion_active || !ctx->line_enabled)
 			MOTOR_Stop();
+		return;
+	}
+
+	/* 未收到 startTask 前不执行循迹, 小车保持静止 */
+	if (!ctx->line_enabled)
+	{
+		MOTOR_Stop();
 		return;
 	}
 

@@ -2,7 +2,7 @@
 
 本文档说明本项目（STM32F407 药品配送小车固件）的 FreeRTOS 移植设计与实现细节。
 内核版本：**FreeRTOS Kernel V11.1.0**（FreeRTOSv202406.04-LTS，2024-04 发布），
-编译器：**ARMCC V5.06 update 4**，Keil MDK 工程 `USER\Template.uvproj`。
+编译器：**ARMCC V5.06 update 4**，Keil MDK 工程 `USER\AIC_MedRobot.uvproj`。
 
 ---
 
@@ -44,7 +44,7 @@
 | `USER\main.c` | 修改 | 主循环拆分为步骤函数 + RTOS 主控任务 + 模式分支 |
 | `USER\stm32f4xx_it.c/h` | 修改 | SVC/PendSV/SysTick：裸机空实现 / RTOS 模式 `__asm` B 跳板 |
 | `CORE\startup_stm32f40_41xxx.s` | 修改 | 删除 3 个空向量桩，补 `IMPORT` 向量符号 |
-| `USER\Template.uvproj` | 修改 | 新增 FreeRTOS 组（6 个文件）与 3 条包含路径 |
+| `USER\AIC_MedRobot.uvproj` | 修改 | 新增 FreeRTOS 组（6 个文件）与 3 条包含路径 |
 
 FreeRTOS 内核源码（仅构建所需文件）位于 `RTOS\FreeRTOS-Kernel\`，**未做任何修改**，
 仅通过 `RTOS\FreeRTOSConfig.h` 配置；原 `FreeRTOSv202406.04-LTS\` 整包不再参与构建，可整体移除。
@@ -109,11 +109,36 @@ typedef struct { char cmd[64]; } WiFiCmdMsg;   // RTOS/rtos_app.h
 - `vTaskWifi`：`atk_8266_at_response_rdCmd(1)` 读到命令后拷贝成 64 字节
   消息 `xQueueSend` 入队（队列深 4，满则丢弃——遥控命令不积压，保证最新
   命令尽快生效）。
-- `vTaskCarControl`：每周期 `RTOS_WifiCmdReceive()` 非阻塞出队，调用原
-  `handle_wifi_command()` 解析并驱动电机。
+- `vTaskCarControl`：每周期 `RTOS_WifiCmdReceive()` 非阻塞出队，调用
+  `wifi_dispatch_commands()` 拆分后逐条调用原 `handle_wifi_command()` 解析并驱动电机。
 - 好处：电机唯一写者；主控任务无需等待串口；命令解析逻辑 100% 复用原函数。
 
-### 5.2 LCD 访问互斥（互斥量，带优先级继承）
+### 5.4 任务控制命令与循迹使能（上位机联动）
+
+- 上位机每条命令以 `\r\n` 结尾；MCU 侧 `wifi_dispatch_commands()` 用 `strtok`
+  按行拆分，解决快速按键（按下/松开间隔 < 100ms）时多条命令合并成一帧、
+  旧逻辑只执行第一条导致小车不停的问题。
+- 新增两条任务命令（裸机/RTOS 共用同一解析入口）：
+  - `startTask`：置 `line_enabled = 1`，使能循迹（上位机"添加配送任务 /
+    呼叫小车 / 返回充电"时发送）。
+  - `stopTask`：置 `line_enabled = 0` 并 `MOTOR_Stop()`（上位机"暂停 / 取消 /
+    手动控制"时发送）。
+- `CAR_StepMotion()` 增加门控：`line_enabled == 0` 时小车保持静止，
+  不进入起步/循迹流程；遥控命令（`forWard` 等）仍可经 `wifi_override`
+  临时驱动，500ms 覆盖窗口结束后回到静止或循迹。
+- 小车初始 `line_enabled = 0`：上电后不自动循迹，等待上位机任务指令。
+
+### 5.5 图传波特率（临时提速）
+
+- 初始化仍按 `usart3_init(115200)` 标准波特率配网。
+- TCP 连接建立后、进入透传前发送 `AT+UART_DEF=921600,8,1,0,0`，
+  成功后用 `usart3_set_baudrate(921600)` 重配 USART3（仅改 BRR，不动
+  `USART3_RX_STA`/TIM7/DMA），提高 JPEG 图传帧率。
+- 若模块固件不支持 `AT+UART_DEF`，保持 115200 继续，功能不受影响。
+- 网络参数（SSID/密码/服务器 IP/端口/图传波特率）集中在
+  `HARDWARE/ATK-ESP8266/wifi_config.h`，不再使用 `common.c` 中的旧硬编码变量。
+
+### 5.6 LCD 访问互斥（互斥量，带优先级继承）
 
 UI 任务与主控任务都会写屏（`UI_Task` 与 `UI_SetDistance/UI_SetObstacle/
 CAMERA_Task`），为防止两任务交叉写 FSMC 造成显示撕裂，LCD 访问统一经：
@@ -126,7 +151,7 @@ RTOS_LcdUnlock(); // xSemaphoreGive(xLcdMutex)
 
 裸机模式下 `RTOS_LcdLock/Unlock` 定义为空操作（`rtos_app.h`），调用点统一。
 
-### 5.3 共享状态与原子性
+### 5.7 共享状态与原子性
 
 - `jpeg_data_ok / jpeg_data_len / jpeg_last_frame_bytes`：由 DCMI 中断写、
   JPEG 任务读；32 位读写是 Cortex-M4 的原子操作，无需加锁。
@@ -257,6 +282,6 @@ __asm void PendSV_Handler(void)
 ## 12. 如何切换与验证
 
 1. 修改 `RTOS\rtos_conf.h` 中 `RTOS_ENABLE` 为 1 或 0。
-2. 用 Keil 打开 `USER\Template.uvproj` 重新编译下载。
+2. 用 Keil 打开 `USER\AIC_MedRobot.uvproj` 重新编译下载。
 3. RTOS 模式运行表现：小车行为与裸机一致，但超声波测距的 30ms 等待期间
    UI/图传/WiFi 依然流畅运行；LED1 常亮表示堆/栈异常。

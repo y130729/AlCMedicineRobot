@@ -23,14 +23,14 @@
 __align(8) u8 USART3_TX_BUF[USART3_MAX_SEND_LEN]; 	//发送缓冲区,最大USART3_MAX_SEND_LEN字节
 #ifdef USART3_RX_EN   								//如果使能了接收
 //接收缓冲区
-u8 USART3_RX_BUF[USART3_MAX_RECV_LEN]; 				//接收缓冲区,最大USART3_MAX_RECV_LEN个字节.
+u8 USART3_RX_BUF[USART3_MAX_RECV_LEN]; 				//接收缓冲区,最大USART3_MAX_RECV_LEN个字节
 
 
 u16 pwmval=320;
 
-//通过判断接收2个字符之间的时间差不大于100ms来判断是不是一次连续的数据.
-//如果2个字符接收间隔超过100ms,则认为不是1次连续数据.也就是超过100ms没有接收到
-//任何数据,则表示此次接收完毕.
+//通过判断接收2个字符之间的时间差不超过100ms来判断是不是一次连续的数据.
+//如果2个字符接收时间间隔超过100ms,则认为不是1次连续数据,也就是超过100ms没有接收到
+//任何数据,则表示本次接收完成.
 //接收到的数据状态
 //[15]:0,没有接收到数据;1,接收到了一帧数据.
 //[14:0]:接收到的数据长度
@@ -50,7 +50,7 @@ void USART3_IRQHandler(void)
 
 			TIM_SetCounter(TIM7,0);    //重新计时
 			if(USART3_RX_STA==0)
-				TIM_Cmd(TIM7, ENABLE);  //使能定时器7
+				TIM_Cmd(TIM7, ENABLE);  //使能定时器
 
 			USART3_RX_BUF[USART3_RX_STA++]=res;		//记录接收到的值
 
@@ -106,26 +106,45 @@ void usart3_init(u32 bound)
 	USART_InitStructure.USART_HardwareFlowControl = USART_HardwareFlowControl_None;//无硬件数据流控制
 	USART_InitStructure.USART_Mode = USART_Mode_Rx | USART_Mode_Tx;	//收发模式
 
-	USART_Init(USART3, &USART_InitStructure); //初始化串口3
+	USART_Init(USART3, &USART_InitStructure); //初始化串口
 
 	USART_Cmd(USART3, ENABLE);               //使能串口
 
   USART_ITConfig(USART3, USART_IT_RXNE, ENABLE);//开启接收中断
 
 	NVIC_InitStructure.NVIC_IRQChannel = USART3_IRQn;
-	NVIC_InitStructure.NVIC_IRQChannelPreemptionPriority=2 ;//抢占优先级2
+	NVIC_InitStructure.NVIC_IRQChannelPreemptionPriority=2 ;//抢占优先级
 	NVIC_InitStructure.NVIC_IRQChannelSubPriority = 3;		//子优先级3
 	NVIC_InitStructure.NVIC_IRQChannelCmd = ENABLE;			//IRQ通道使能
 	NVIC_Init(&NVIC_InitStructure);	//根据指定的参数初始化VIC寄存器
 	TIM7_Int_Init(1000-1,8400-1);		//100ms中断
 	USART3_RX_STA=0;		//清空
-	TIM_Cmd(TIM7, DISABLE); //关闭定时器7
+	TIM_Cmd(TIM7, DISABLE); //关闭定时器
 
 
 
 
 }
 
+/* ==================== 运行中更改波特率 ====================
+ * 仅重写 USART3 波特率寄存器并保持使能, 不触碰接收状态标志
+ * (USART3_RX_STA)、TIM7 组帧定时器与 DMA 配置, 供图传前临时提速使用。
+ * bound: 新波特率(如 921600) */
+void usart3_set_baudrate(u32 bound)
+{
+	USART_InitTypeDef USART_InitStructure;
+
+	USART_InitStructure.USART_BaudRate = bound;
+	USART_InitStructure.USART_WordLength = USART_WordLength_8b;
+	USART_InitStructure.USART_StopBits = USART_StopBits_1;
+	USART_InitStructure.USART_Parity = USART_Parity_No;
+	USART_InitStructure.USART_HardwareFlowControl = USART_HardwareFlowControl_None;
+	USART_InitStructure.USART_Mode = USART_Mode_Rx | USART_Mode_Tx;
+
+	USART_Init(USART3, &USART_InitStructure);	/* 更新 BRR */
+	USART_Cmd(USART3, ENABLE);					/* 保持使能 */
+	USART_ITConfig(USART3, USART_IT_RXNE, ENABLE);	/* 保持 RX 中断 */
+}
 
 
 

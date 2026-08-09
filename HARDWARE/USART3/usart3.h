@@ -23,5 +23,6 @@ extern u8  USART3_TX_BUF[USART3_MAX_SEND_LEN]; 		//发送缓冲
 extern vu16 USART3_RX_STA;   						//接收数据状态
 
 void usart3_init(u32 bound);
+void usart3_set_baudrate(u32 bound);
 void u3_printf(char* fmt, ...);
 #endif

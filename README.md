@@ -1,4 +1,4 @@
-﻿# Template_stm32f407 — STM32F407 药品配送小车固件
+﻿# AIC_MedRobot_stm32f407 — STM32F407 药品配送小车固件
 
 ## FreeRTOS 支持
 
@@ -23,7 +23,7 @@
 ## 目录结构
 
 ```
-Template_stm32f407/
+AIC_MedRobot_stm32f407/
 ├── CORE/              # Cortex-M4 内核文件 & 启动文件
 ├── FWLIB/             # STM32F4 标准外设库
 ├── HARDWARE/          # 外设驱动模块（按功能拆分）
@@ -54,7 +54,7 @@ Template_stm32f407/
 ├── SYSTEM/            # 基础支持模块 (delay/sys/usart)
 └── USER/              # 用户代码 & 工程配置
     ├── main.c         # 主程序入口
-    ├── Template.uvproj      # Keil 工程文件
+    ├── AIC_MedRobot.uvproj      # Keil 工程文件
     └── ...
 ```
 
@@ -169,10 +169,10 @@ Template_stm32f407/
 
 ## 编译与烧录
 
-1. 打开 `USER/Template.uvproj`（Keil µVision）
+1. 打开 `USER/AIC_MedRobot.uvproj`（Keil µVision）
 2. 选择芯片：**STM32F407ZGT6**
 3. 点击 **Build** (F7) 编译
-4. 生成 `OBJ/Template.hex`，使用 J-Link / ST-Link 烧录
+4. 生成 `OBJ/AIC_MedRobot.hex`，使用 J-Link / ST-Link 烧录
 
 ---
 
