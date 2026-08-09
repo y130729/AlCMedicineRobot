@@ -47,7 +47,7 @@ void MOTOR_SetSpeed(u16 left_speed, u16 right_speed)
 
 void MOTOR_Stop(void)
 {
-	MOTOR_SetSpeed(PWM_PERIOD, PWM_PERIOD);
+	MOTOR_SetSpeed(0, 0);
 }
 
 /* ==================== 通用方向运动 ==================== */

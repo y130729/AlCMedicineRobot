@@ -43,8 +43,8 @@ void TIM14_PWM_Init(u32 arr,u32 psc)
 	TIM_OCStructInit(&TIM_OCInitStructure);
 	TIM_OCInitStructure.TIM_OCMode = TIM_OCMode_PWM1; 						//选择定时器模式:TIM脉冲宽度调制模式2
  	TIM_OCInitStructure.TIM_OutputState = TIM_OutputState_Enable; //比较输出使能
-	TIM_OCInitStructure.TIM_OCPolarity = TIM_OCPolarity_Low; 			//输出极性:TIM输出比较极性低
-	TIM_OCInitStructure.TIM_Pulse = arr + 1;                       //低有效PWM，初始有效占空比为0
+	TIM_OCInitStructure.TIM_OCPolarity = TIM_OCPolarity_High;			//输出极性:高有效（驱动板高电平有效）
+	TIM_OCInitStructure.TIM_Pulse = 0;                       //高有效PWM，初始占空比为0（停止）
 	TIM_OC1Init(TIM14, &TIM_OCInitStructure);  										//根据T指定的参数初始化外设TIM1 4OC1
 
 	//启动定时器14
@@ -85,8 +85,8 @@ void TIM13_PWM_Init(u32 arr,u32 psc)
 	TIM_OCStructInit(&TIM_OCInitStructure);
 	TIM_OCInitStructure.TIM_OCMode = TIM_OCMode_PWM1; 						//选择定时器模式:TIM脉冲宽度调制模式2
  	TIM_OCInitStructure.TIM_OutputState = TIM_OutputState_Enable; //比较输出使能
-	TIM_OCInitStructure.TIM_OCPolarity = TIM_OCPolarity_Low; 			//输出极性:TIM输出比较极性低
-	TIM_OCInitStructure.TIM_Pulse = arr + 1;                       //低有效PWM，初始有效占空比为0
+	TIM_OCInitStructure.TIM_OCPolarity = TIM_OCPolarity_High;			//输出极性:高有效（驱动板高电平有效）
+	TIM_OCInitStructure.TIM_Pulse = 0;                       //高有效PWM，初始占空比为0（停止）
 	TIM_OC1Init(TIM13, &TIM_OCInitStructure);  										//根据T指定的参数初始化外设TIM1 4OC1
 
 	//启动定时器13

@@ -4,6 +4,8 @@
 #include "sys.h"
 
 /* ==================== 电机参数 ==================== */
+/* PWM 输出高有效(驱动板高电平有效): 有效占空比 = 速度/PWM_PERIOD,
+ * 0 = 停止, 500 = 全速(恒高)。PWM 频率 2kHz(ARR=499, 预分频 84-1)。 */
 #define PWM_PERIOD              500
 
 #define MOTOR_RUN_SPEED         300
