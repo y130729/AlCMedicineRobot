@@ -55,7 +55,9 @@ AIC_MedRobot_stm32f407/
 ├── OBJ/               # 编译产物
 ├── SYSTEM/            # 基础支持模块 (delay/sys/usart)
 └── USER/              # 用户代码 & 工程配置
-    ├── main.c         # 主程序入口
+    ├── main.c         # 主程序入口（硬件初始化 + 模式分支）
+    ├── car_app.c      # 小车应用层（7 个步骤函数 + 主循环 + RTOS 主控任务）
+    ├── wifi_cmd.c     # WiFi 命令解析与执行（startTask/stopTask 等）
     ├── AIC_MedRobot.uvproj      # Keil 工程文件
     └── ...
 ```
