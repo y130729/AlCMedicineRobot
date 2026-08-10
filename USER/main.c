@@ -29,16 +29,16 @@
 /* ==================== 主函数 ==================== */
 int main(void)
 {
-	uart_init(115200);
+	uart_init(115200);/*串口1初始化，用于调试信息的打印*/
 	delay_init(168);
 	LED_Init();
 	LCD_Init();
-	Adc_Init();
+	Adc_Init();/*ADC初始化，用于读取循迹传感器数据*/
 
 	/* WiFi相关初始化 */
-	usart2_init(9600);
-	usart3_init(115200);
-	USART3_DMA_TX_Init();
+	usart2_init(9600);/*预留串口2初始化，暂时弃用*/
+	usart3_init(115200);/*串口3初始化，用于WiFi模块通信*/
+	USART3_DMA_TX_Init();/*串口3 DMA发送初始化，用于WiFi发送视频帧数据*/
 
 #if TOUCH_MODULE_ENABLE
 	tp_dev.init();
@@ -46,7 +46,7 @@ int main(void)
 	UI_Init();
 
 	MOTOR_Init();
-	EXTIX_Init();
+	EXTIX_Init();/*外部中断初始化*/
 	HC_SR04_Init();
 	TIM3_Int_Init(1000 - 1, 84 - 1);
 
@@ -61,7 +61,7 @@ int main(void)
 	/* 切换为JPEG模式以支持WiFi图传 */
 	OV2640_JPEG_Mode();
 	dcmi_rx_callback = jpeg_frame_callback;
-	DCMI_DMA_Init((u32)jpeg_buf, JPEG_BUF_SIZE, DMA_MemoryDataSize_Word, DMA_MemoryInc_Enable);
+	DCMI_DMA_Init((u32)jpeg_buf, JPEG_BUF_SIZE, DMA_MemoryDataSize_Word, DMA_MemoryInc_Enable);/* JPEG图像数据接收缓冲区初始化 */
 	OV2640_OutSize_Set(jpeg_img_size_tbl[3][1], jpeg_img_size_tbl[3][0]);  // QVGA 320x240
 	CAMERA_SetJpegMode(1);
 	DCMI_Start();

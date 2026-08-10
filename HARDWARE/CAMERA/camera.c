@@ -40,6 +40,7 @@ static u8 camera_jpeg_mode = 0;
 static u8 jpeg_occlusion_count = 0;
 static u8 jpeg_occlusion_clear_count = 0;
 
+/*检测摄像头是否被遮挡*/
 static void CAMERA_DetectOcclusion(void)
 {
 	u32 sum = 0;
@@ -146,6 +147,7 @@ static void CAMERA_DetectOcclusion(void)
 	}
 }
 
+/* JPEG 模式下的遮挡检测: 仅根据 JPEG 帧大小判断遮挡, 避免占用 LCD 总线影响 WiFi 图传。 */
 static void CAMERA_DetectJpegOcclusion(void)
 {
 	u8 occluded;
@@ -364,20 +366,21 @@ void CAMERA_Task(u32 now_ms)
 
 	displayed_frame = frame;
 	next_refresh_ms = now_ms + CAMERA_REFRESH_MS;
+	/* JPEG 模式下不显示图像，避免占用 LCD 总线影响 WiFi 图传。 */
 	if(camera_jpeg_mode)
 	{
-		CAMERA_DetectJpegOcclusion();
+		CAMERA_DetectJpegOcclusion();/*使用JPEG版本的遮挡检测*/
 	}
 	else
 	{
-		CAMERA_DetectOcclusion();
+		CAMERA_DetectOcclusion();/*使用普通版本的遮挡检测*/
 		if((s32)(now_ms - next_recognition_ms) >= 0)
 		{
 			CAMERA_RecognizeColor();
 			next_recognition_ms = now_ms + COLOR_RECOGNITION_MS;
 		}
 	}
-
+	
 	if(camera_jpeg_mode)
 	{
 		static u8 jpeg_status_shown = 0;
@@ -389,9 +392,9 @@ void CAMERA_Task(u32 now_ms)
 		return;
 	}
 
-	if(UI_GetPage() == UI_PAGE_NETWORK)
+	if(UI_GetPage() == UI_PAGE_NETWORK)/*网络界面不显示摄像头*/
 		return;
-	if(camera_zoomed)
+	if(camera_zoomed)/*画面放大模式*/
 	{
 		CAMERA_DisplayZoomed((UI_GetPage() == UI_PAGE_CONTROL) &&
 		                     EXTIX_IsImageMenuVisible());
@@ -399,6 +402,7 @@ void CAMERA_Task(u32 now_ms)
 	else if((UI_GetPage() != UI_PAGE_CONTROL) ||
 	        !EXTIX_IsImageMenuVisible())
 	{
+		/* 菜单未显示时，全屏显示摄像头画面，避免菜单遮挡。 */
 		LCD_Color_Fill(CAMERA_X, CAMERA_Y,
 		               CAMERA_X + CAMERA_WIDTH - 1,
 		               CAMERA_Y + CAMERA_HEIGHT - 1,

@@ -12,6 +12,7 @@
 /* WiFi 命令消息: 由 WiFi 任务从 USART3 接收缓冲区拷贝入队,
  * 控制任务出队后调用原 handle_wifi_command 解析执行。 */
 #define WIFI_CMD_MSG_LEN   64
+/* WiFi 命令消息结构体。由于FreeRTOS 的 xQueueSend 要求传入的是指向数据的指针而不是数据本身，因此需要用结构体容器来存储消息 */
 typedef struct
 {
 	char cmd[WIFI_CMD_MSG_LEN];

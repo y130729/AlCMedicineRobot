@@ -111,7 +111,7 @@ static void vTaskWifi(void *pvParameters)
 	xLastWake = xTaskGetTickCount();
 	for(;;)
 	{
-		vTaskDelayUntil(&xLastWake, PERIOD_WIFI_MS);
+		vTaskDelayUntil(&xLastWake, PERIOD_WIFI_MS);//每10ms轮询一次WiFi命令
 
 		pCmd = atk_8266_at_response_rdCmd(1);
 		if(pCmd == 0)
@@ -121,8 +121,8 @@ static void vTaskWifi(void *pvParameters)
 		if(len == 0)
 			continue;
 		if(len >= WIFI_CMD_MSG_LEN)
-			len = WIFI_CMD_MSG_LEN - 1;
-		memcpy(msg.cmd, pCmd, len);
+			len = WIFI_CMD_MSG_LEN - 1;/* 队列消息长度限制, 避免溢出 */
+		memcpy(msg.cmd, pCmd, len);/* 拷贝命令字符串 */
 		msg.cmd[len] = 0;
 
 		/* 队列满则丢弃: 遥控命令不积压, 保证最新命令尽快生效 */
@@ -147,7 +147,7 @@ static void vTaskJpeg(void *pvParameters)
 		if(jpeg_data_ok == 1)
 			jpeg_process_and_send();
 
-		if(!USART3_DMA_IsBusy() && (jpeg_data_ok == 2))
+		if(!USART3_DMA_IsBusy() && (jpeg_data_ok == 2))/* 发送完成, 重启 DCMI 采集 */
 		{
 			DMA2_Stream1->NDTR = JPEG_BUF_SIZE;
 			DMA_SetCurrDataCounter(DMA2_Stream1, JPEG_BUF_SIZE);
@@ -164,13 +164,13 @@ void RTOS_Start(void)
 {
 	BaseType_t xRet;
 
-	xLcdMutex = xSemaphoreCreateMutex();
-	xWifiCmdQueue = xQueueCreate(4, sizeof(WiFiCmdMsg));
+	xLcdMutex = xSemaphoreCreateMutex();/* 创建 LCD 互斥量 */
+	xWifiCmdQueue = xQueueCreate(4, sizeof(WiFiCmdMsg));/* 创建 WiFi 命令队列, 最多 4 条命令 */
 	if((xLcdMutex == NULL) || (xWifiCmdQueue == NULL))
 	{
 		vApplicationMallocFailedHook();
 	}
-
+    /* 创建任务 */
 	xRet = xTaskCreate(vTaskCarControl, "CarCtrl", TASK_STACK_CONTROL,
 	                   NULL, TASK_PRIO_CONTROL, NULL);
 	if(xRet != pdPASS) vApplicationMallocFailedHook();

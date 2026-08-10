@@ -98,13 +98,13 @@ static void CAR_StepWifi(CAR_Ctx *ctx)
 	char *pMsgBuff = 0;
 
 #if RTOS_ENABLE
-	WiFiCmdMsg msg;
+	WiFiCmdMsg msg;/*创建WiFi命令消息结构体*/
 	if (RTOS_WifiCmdReceive(&msg))
 	{
 		pMsgBuff = msg.cmd;
-		if (wifi_dispatch_commands(pMsgBuff, &ctx->pwmval, &ctx->line_enabled))
+		if (wifi_dispatch_commands(pMsgBuff, &ctx->pwmval, &ctx->line_enabled))/*解析执行WiFi命令*/
 		{
-			ctx->wifi_override = 1;
+			ctx->wifi_override = 1;/* 如果接收到WiFi命令，则WiFi 遥控优先 */
 			ctx->wifi_override_end = ctx->now_ms + 500;
 		}
 	}
@@ -119,7 +119,7 @@ static void CAR_StepWifi(CAR_Ctx *ctx)
 		}
 	}
 #endif
-	if (ctx->wifi_override && (ctx->now_ms >= ctx->wifi_override_end))
+	if (ctx->wifi_override && (ctx->now_ms >= ctx->wifi_override_end))/*超时后WiFi控制结束*/
 	{
 		ctx->wifi_override = 0;
 		ctx->startup_end_ms = ctx->now_ms + MOTOR_START_TIME_MS;
@@ -162,12 +162,12 @@ static void CAR_StepCamera(CAR_Ctx *ctx)
 	RTOS_LcdLock();
 	CAMERA_Task(ctx->now_ms);
 	RTOS_LcdUnlock();
-
+	/* 遮挡检测: 遮挡时立即停车, 解除遮挡后延时起步 */
 	if (CAMERA_IsOccluded())
 	{
 		if (!ctx->camera_occlusion_active)
 		{
-			ctx->camera_occlusion_active = 1;
+			ctx->camera_occlusion_active = 1;/* 遮挡状态标志位激活 */
 			MOTOR_Stop();
 		}
 	}
@@ -251,7 +251,7 @@ static void CAR_StepMotion(CAR_Ctx *ctx)
 		MOTOR_ForwardDual(MOTOR_LEFT_START_SPEED, MOTOR_START_SPEED);
 		return;
 	}
-
+	/* 循迹逻辑: 仅在 WiFi 遥控未激活时执行 */
 	if (!LINE_IsBlack(adcL) && !LINE_IsBlack(adcM) && !LINE_IsBlack(adcR))
 	{
 		if (ctx->last_direction < 0)
@@ -311,12 +311,12 @@ void CAR_LineFollow(void)
 
 void vTaskCarControl(void *pvParameters)
 {
-	CAR_Ctx ctx;
-	TickType_t xLastWake;
+	CAR_Ctx ctx;/*创建小车参数结构体*/
+	TickType_t xLastWake;/*获取当前系统滴答数*/
 
-	(void)pvParameters;
+	(void)pvParameters;/*避免编译器警告*/
 	CAR_CtxInit(&ctx);
-	ctx.startup_end_ms = EXTIX_GetMillis() + MOTOR_START_TIME_MS;
+	ctx.startup_end_ms = EXTIX_GetMillis() + MOTOR_START_TIME_MS;/*小车启动时间*/
 
 	xLastWake = xTaskGetTickCount();
 	while (1)
