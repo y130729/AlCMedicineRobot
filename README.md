@@ -152,6 +152,7 @@ AIC_MedRobot_stm32f407/
 #### 🖥️ 触摸屏 UI
 - 3 页面：控制 / 数据 / 网络
 - 实时距离、避障状态显示
+- 网络页面显示当前网络配置：WiFi 名称、本机 IP、服务器 IP/端口、在线状态
 
 ## 已知问题与注意事项
 
@@ -312,6 +313,9 @@ typedef struct { char cmd[64]; } WiFiCmdMsg;   // RTOS/rtos_app.h
 - 若模块固件不支持 `AT+UART_DEF`，保持 115200 继续，功能不受影响。
 - 网络参数（SSID/密码/服务器 IP/端口/图传波特率）集中在
   `HARDWARE/ATK-ESP8266/wifi_config.h`，不再使用 `common.c` 中的旧硬编码变量。
+- 配网成功（CWJAP 应答 `WIFI GOT IP`）后、进入透传模式前发送 `AT+CIFSR`
+  查询并缓存 STA 本机 IP（`wifista.c` 的 `atk_8266_query_local_ip()`），
+  供 UI 网络页面只读显示；透传模式下不再发送 AT 指令。
 
 ### 5.4 LCD 访问互斥（互斥量，带优先级继承）
 

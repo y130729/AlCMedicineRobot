@@ -5,6 +5,7 @@
 #include "exti.h"
 #include "ov2640.h"
 #include "camera.h"
+#include "wifista.h"
 
 #define UI_DARK       0x1082
 #define UI_PANEL      0x18E3
@@ -310,8 +311,25 @@ static void UI_DrawDataPage(void)
 static void UI_DrawNetworkPage(void)
 {
 	LCD_Fill(0, 24, 239, 288, BLACK);
-	UI_ShowText(72, 120, GRAY, BLACK, "NETWORK");
-	UI_ShowText(64, 145, GRAY, BLACK, "NOT CONFIG");
+	UI_ShowText(76, 27, LIGHTBLUE, BLACK, "NETWORK INFO");
+
+	UI_ShowText(5, 60, GRAY, BLACK, "WiFi:");
+	UI_ShowText(62, 60, WHITE, BLACK, (u8 *)ATK_8266_GetSSID());
+
+	UI_ShowText(5, 82, GRAY, BLACK, "IP:");
+	UI_ShowText(62, 82, WHITE, BLACK, (u8 *)ATK_8266_GetLocalIP());
+
+	UI_ShowText(5, 104, GRAY, BLACK, "Server:");
+	UI_ShowText(62, 104, WHITE, BLACK, (u8 *)ATK_8266_GetServerIP());
+
+	UI_ShowText(5, 126, GRAY, BLACK, "Port:");
+	UI_ShowText(62, 126, WHITE, BLACK, (u8 *)ATK_8266_GetServerPort());
+
+	if(ATK_8266_IsOnline())
+		UI_ShowText(5, 160, GREEN, BLACK, "State: Online");
+	else
+		UI_ShowText(5, 160, RED, BLACK, "State: Offline");
+
 	image_settings_drawn = 0;
 	UI_DrawTabs(UI_KEY_NONE);
 }
