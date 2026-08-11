@@ -39,6 +39,7 @@ void MOTOR_TurnRight(u16 speed);
 
 /* 循迹专用 */
 void MOTOR_LineForward(void);
+void MOTOR_LineForwardSpeed(u16 speed);  /* 进站缓行: 以指定速度循迹直行 */
 void MOTOR_LineTurnLeft(void);
 void MOTOR_LineTurnRight(void);
 void MOTOR_LineSearchLeft(void);

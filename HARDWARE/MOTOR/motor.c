@@ -97,6 +97,13 @@ void MOTOR_LineForward(void)
 	MOTOR_SetSpeed(MOTOR_LEFT_RUN_SPEED, MOTOR_RUN_SPEED);
 }
 
+void MOTOR_LineForwardSpeed(u16 speed)
+{
+	GPIO_SetBits(GPIOC, GPIO_Pin_3 | GPIO_Pin_4);
+	GPIO_ResetBits(GPIOC, GPIO_Pin_2 | GPIO_Pin_5);
+	MOTOR_SetSpeed(speed, speed);
+}
+
 void MOTOR_LineTurnLeft(void)
 {
 	MOTOR_TurnLeft(LINE_PIVOT_SPEED);

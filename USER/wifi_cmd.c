@@ -5,6 +5,7 @@
 #include "string.h"
 #include "motor.h"
 #include "wifi_cmd.h"
+#include "car_app.h"
 
 /* 遥控命令: 手动控制(forward/backward/left/right/stop/speed) 与任务控制
  * (startTask/stopTask)。startTask 使能循迹, stopTask 停止循迹并刹停。
@@ -44,6 +45,41 @@ u8 handle_wifi_command(char *pMsgBuff, u16 *pwmval, u8 *line_enabled)
 	{
 		*line_enabled = 0;
 		MOTOR_Stop();
+		return 1;
+	}
+	/* ---- 任务配送命令(P0 闭环协议, 见 P0_task_delivery_design.md) ----
+	 * TASK_START,<task_id>,<from>,<to> / STOP,<task_id>,<station_id> /
+	 * TASK_CONFIRM,<task_id>,<load|unload>,<user> /
+	 * TASK_PAUSE,<task_id> / TASK_RESUME,<task_id> / TASK_CANCEL,<task_id>
+	 * 统一交给 CAR_OnTaskCommand 处理(状态机在 car_app.c), 命令本身不触发遥控覆盖。 */
+	if (strstr((const char*)pMsgBuff, (const char*)"TASK_START"))
+	{
+		CAR_OnTaskCommand(CAR_CMD_TASK_START, pMsgBuff + 10, line_enabled);
+		return 1;
+	}
+	if (strstr((const char*)pMsgBuff, (const char*)"TASK_CONFIRM"))
+	{
+		CAR_OnTaskCommand(CAR_CMD_TASK_CONFIRM, pMsgBuff + 12, line_enabled);
+		return 1;
+	}
+	if (strstr((const char*)pMsgBuff, (const char*)"TASK_PAUSE"))
+	{
+		CAR_OnTaskCommand(CAR_CMD_TASK_PAUSE, pMsgBuff + 10, line_enabled);
+		return 1;
+	}
+	if (strstr((const char*)pMsgBuff, (const char*)"TASK_RESUME"))
+	{
+		CAR_OnTaskCommand(CAR_CMD_TASK_RESUME, pMsgBuff + 11, line_enabled);
+		return 1;
+	}
+	if (strstr((const char*)pMsgBuff, (const char*)"TASK_CANCEL"))
+	{
+		CAR_OnTaskCommand(CAR_CMD_TASK_CANCEL, pMsgBuff + 11, line_enabled);
+		return 1;
+	}
+	if (strstr((const char*)pMsgBuff, (const char*)"STOP,"))
+	{
+		CAR_OnTaskCommand(CAR_CMD_STOP, pMsgBuff + 5, line_enabled);
 		return 1;
 	}
 	return 0;

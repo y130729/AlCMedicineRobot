@@ -4,6 +4,7 @@
 #include "stdio.h"
 #include "string.h"
 #include "timer.h"
+#include "wifi_transfer.h"
 #include "lcd.h"
 
 //////////////////////////////////////////////////////////////////////////////////
@@ -155,6 +156,9 @@ void u3_printf(char* fmt,...)
 {
 	u16 i,j;
 	va_list ap;
+	if (USART3_DMA_IsBusy())/* 图传 DMA 正在发送视频帧: 丢弃本次文本, 避免破坏帧数据(上位机对 ACK 有 500ms 重发兜底) */
+		return;
+
 	va_start(ap,fmt);
 	vsprintf((char*)USART3_TX_BUF,fmt,ap);
 	va_end(ap);

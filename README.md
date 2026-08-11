@@ -132,6 +132,35 @@ AIC_MedRobot_stm32f407/
 帧头(0xAA55) + JPEG长度(4B LE) + JPEG数据
 ```
 
+**任务配送命令（上位机 → 小车，P0 闭环协议）**
+
+| 指令 | 说明 |
+| --- | --- |
+| `TASK_START,<task_id>,<from>,<to>` | 下发任务，如 `TASK_START,T-2025,S1,S3` |
+| `STOP,<task_id>,<station_id>` | 上位机识别到目标站点后要求停车 |
+| `TASK_CONFIRM,<task_id>,<load\|unload>,<user>` | 装/卸药人工确认 |
+| `TASK_PAUSE,<task_id>` | 暂停任务 |
+| `TASK_RESUME,<task_id>` | 恢复任务 |
+| `TASK_CANCEL,<task_id>` | 取消任务回 IDLE |
+
+> 所有任务命令均回 `ACK,<task_id>,<0|1>`；上位机 500ms 未收到 ACK 自动重发（最多 3 次）。
+> 站点 ID：S1=药房01、S2=病房001、S3=病房002、S4=车库01（与上位机下拉项一一对应）。
+
+**任务状态上报（小车 → 上位机，文本行，`\r\n` 结尾）**
+
+| 报文 | 说明 |
+| --- | --- |
+| `ACK,<task_id>,<0|1>` | 下行命令确认，1=成功 0=拒绝 |
+| `ENTER_STATION,<task_id>,<seq>` | 三路全黑横带触发进站（seq=0 取药点 / 1 病房），请求开启识别窗口 |
+| `STATUS,<task_id>,<state>` | state: NAV/APPROACH/STOPPED/WAIT_LOAD/WAIT_UNLOAD/PAUSED/TIMEOUT/CANCELLED |
+| `TASK_ARRIVE,<task_id>,<station_id>` | 已停稳，等待人工确认 |
+| `TASK_DONE,<task_id>` | 卸药确认后任务完成 |
+| `HEARTBEAT,<battery>,<state>` | 每 1s 心跳，上位机据此刷新电量与在线状态 |
+
+> 文本行与视频帧共用一条 TCP 连接：上位机先按 `\r\n` 拆行、命中协议前缀才按文本处理，
+> 其余数据走 AA55 帧解析。车端在视频 DMA 发送期间会丢弃文本以避免破坏帧数据，
+> 由上位机 ACK 重发机制兜底。
+
 ### 功能详解
 
 #### 🚗 黑线循迹
@@ -153,12 +182,21 @@ AIC_MedRobot_stm32f407/
 - 3 页面：控制 / 数据 / 网络
 - 实时距离、避障状态显示
 - 网络页面显示当前网络配置：WiFi 名称、本机 IP、服务器 IP/端口、在线状态
+- 数据页（调试）显示三路循迹 ADC 原始值（L/M/R）与运动状态/速度（ST/PWM）
+
+#### 📦 任务配送（P0 闭环）
+- 状态机：`TASK_IDLE → NAV_TO_LOAD → APPROACH_LOAD → WAIT_LOAD → NAV_TO_WARD → APPROACH_WARD → WAIT_UNLOAD → DONE`
+- 进站触发：左中右三路同时 ≥2000 且连续 10 个采样周期（约 20ms）→ 降速至 PWM 200 → 上报 `ENTER_STATION`
+- 停车：收到目标站点 `STOP` 且校验通过后停车，上报 `TASK_ARRIVE`；2s 内未收到 `STOP` 强制停车（兜底，上报 TIMEOUT）
+- 超时：每段循迹 5 分钟超时中止；装/卸确认 5 分钟超时 LED2 闪烁告警（蜂鸣器 PF8 已被 TIM13 PWM 占用，不可用）
+- 心跳：每 1s 上报电量与任务状态（电量暂为固定值 100，预留电池采样扩展）
 
 ## 已知问题与注意事项
 
 ### 硬件资源占用说明（已核对）
 
 - **PF9（LED1/D1）由 TIM14 右电机 PWM 独占**：`LED_Init()` 已不再配置 PF9，指示灯统一使用 PF10（LED2/D2）；D1 因引脚被 PWM 占用在硬件上不可用，`led.h` 中 `LED1` 宏仅作引脚记录，请勿使用。
+- **PF8（蜂鸣器）由 TIM13 左电机 PWM 独占**：`beep.h` 的 `BEEP` 宏在电机启用后不可用（引脚被定时器复用），任务确认超时告警改用 LED2 闪烁。
 - **PB8/PB9 为按键 EXTI 输入**：KEY1(PB8)/KEY0(PB9) 下降沿触发（`EXTIX_Init`）；24CXX 软件 IIC（`AT24CXX_Init`）仅在 `TP_Init()` 电阻屏分支初始化。本工程使用电容屏（GT9147/OTT2001A），不初始化 24CXX，无实际冲突；若后续改用电阻屏，需重新评估按键与校准存储的引脚复用。
 
 > 循迹 ADC 通道核对（依据 STM32F407 官方 CubeMX 数据库）：左=PF7(ADC3_CH5)、
@@ -171,13 +209,16 @@ AIC_MedRobot_stm32f407/
 - **`MOTOR_Stop()` 移除 100ms 阻塞延时**：障碍/遮挡触发停车时立即响应，不再阻塞主循环。
 - **USART2 中断优先级越界修正**：`NVIC_PriorityGroup_2` 下抢占优先级范围 0~3，原配置 4/5 被静默截断为最高优先级，已改为 3/2。
 - **JPEG 帧缓冲越界防护**：帧头/CRC 写入与 `memmove` 增加边界检查，防止 JPEG 填满缓冲时越界写。
-- **JPEG 模式下摄像头遮挡检测**：JPEG 模式时 `camera_frame`（RGB565 预览缓冲）不再更新，原遮挡/颜色检测基于陈旧数据。现增加基于 JPEG 帧大小的遮挡启发式检测（阈值 `JPEG_OCCLUSION_SIZE_THRESHOLD`，按实际场景调整），并停止刷新陈旧的预览画面。
+- **JPEG 模式下摄像头遮挡检测**：JPEG 模式时 `camera_frame`（RGB565 预览缓冲）不再更新，原遮挡检测基于陈旧数据。现增加基于 JPEG 帧大小的遮挡启发式检测（阈值 `JPEG_OCCLUSION_SIZE_THRESHOLD`，按实际场景调整），并停止刷新陈旧的预览画面。
 - **`LED_Init()` 不再配置 PF9**：PF9 已由 TIM14 右电机 PWM（TIM14_CH1）独占，LED1(D1) 硬件上不可用；现仅初始化 PF10（LED2），消除 LED 初始化对 PWM 引脚的潜在覆写。
 
 ### 仍待优化
 
 - **图传帧率仍受限于串口带宽**：已临时提升至 921600，若要更高帧率需进一步压缩 JPEG 尺寸或更换更高带宽链路。
 - **USART2 为历史遗留初始化**（蓝牙/旧版 8266 驱动），当前未被使用，可考虑移除。
+- **心跳电量暂为固定值 100**：待接入电池电压采样后替换 `TASK_BATTERY_DEFAULT`。
+- **站点 ID 暂为编译期常量**：后续可存入 24CXX EEPROM 便于现场配置（注意 PB8/PB9 按键复用约束）。
+
 
 ## FreeRTOS 移植设计
 
@@ -265,7 +306,7 @@ CAR_StepJpeg   ->  JPEG 帧处理与发送（仅裸机；RTOS 由 vTaskJpeg 承�
 CAR_StepUi     ->  UI_Task（仅裸机；RTOS 由 vTaskUi 承担）
 CAR_StepCamera ->  CAMERA_Task + 遮挡检测（含 LCD 互斥）
 CAR_StepRange  ->  超声波测距 + 避障逻辑（含 LCD 互斥）
-CAR_StepAdc    ->  ADC 采样 + LED 心跳
+CAR_StepAdc    ->  ADC 采样 + LED 心跳 + 数据页刷新（循迹值/状态/速度）
 CAR_StepMotion ->  避障/遮挡/遥控暂停 -> 起步加速 -> 循迹逻辑
 ```
 
@@ -337,7 +378,7 @@ RTOS_LcdUnlock(); // xSemaphoreGive(xLcdMutex)
 
 - `jpeg_data_ok / jpeg_data_len / jpeg_last_frame_bytes`：由 DCMI 中断写、
   JPEG 任务读；32 位读写是 Cortex-M4 的原子操作，无需加锁。
-- `adcL/adcM/adcR`：仅主控任务读写。
+- `adcL/adcM/adcR`：仅主控任务读写；UI 通过 `UI_SetLineSensors()` 接收副本用于数据页显示。
 - `UI_GetPage()` 返回的页面号：UI 任务写、主控任务读，单字节原子，允许
   轻微滞后（仅影响画面裁剪判断），可接受。
 
