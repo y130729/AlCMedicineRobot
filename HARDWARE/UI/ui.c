@@ -422,9 +422,18 @@ void UI_Task(void)
 	u8 saturation;
 	u8 menu_visible;
 
+	/*
+	 * 第一部分：图像参数（亮度/对比度/饱和度）处理。
+	 * 从按键菜单读取用户设置的图像参数，应用到 OV2640 摄像头，
+	 * 并负责在控制页面上绘制/更新/清除对应的参数显示行。
+	 */
 	if(EXTIX_GetImageSettings(&selected, &brightness,
 	                          &contrast, &saturation, &menu_visible))
 	{
+		/*
+		 * 首次应用或数值发生变化时才写寄存器，避免反复操作
+		 * OV2640 造成不必要的开销。
+		 */
 		if(!image_settings_applied || brightness != drawn_brightness)
 			OV2640_Brightness(brightness);
 		if(!image_settings_applied || contrast != drawn_contrast)
@@ -433,21 +442,34 @@ void UI_Task(void)
 			OV2640_Color_Saturation(saturation);
 		image_settings_applied = 1;
 
+		/*
+		 * 不在控制页面时无需显示图像设置，仅复位绘制标记。
+		 */
 		if(current_page != UI_PAGE_CONTROL)
 		{
 			image_settings_drawn = 0;
 		}
+		/*
+		 * 菜单已关闭：若之前画过设置区域则用黑色清除该区域。
+		 */
 		else if(!menu_visible)
 		{
 			if(image_settings_drawn)
 				LCD_Fill(5, 132, 108, 181, BLACK);
 			image_settings_drawn = 0;
 		}
+		/*
+		 * 菜单首次显示：一次性绘制全部三行参数。
+		 */
 		else if(!image_settings_drawn)
 		{
 			UI_DrawImageSettings(selected, brightness, contrast, saturation);
 			image_settings_drawn = 1;
 		}
+		/*
+		 * 菜单已显示：只重绘“值变化”或“选中项变化”的行，
+		 * 减少 LCD 刷新次数。
+		 */
 		else
 		{
 			if(brightness != drawn_brightness ||
@@ -466,15 +488,20 @@ void UI_Task(void)
 				UI_DrawImageSettingRow(IMAGE_PARAM_SATURATION,
 				                       selected, saturation);
 		}
+		/* 记录本次已绘制的参数状态，供下次对比。 */
 		drawn_image_param = selected;
 		drawn_brightness = brightness;
 		drawn_contrast = contrast;
 		drawn_saturation = saturation;
 	}
 
+	/* 第二部分：触摸屏扫描与按下状态处理。 */
 	tp_dev.scan(0);
+
+	/* 手指按下：进入触摸处理流程。 */
 	if(tp_dev.sta & TP_PRES_DOWN)
 	{
+		/* 按下的第一帧：复位所有触摸状态，等待重新确定目标。 */
 		if(!touch_was_down)
 		{
 			touch_was_down = 1;
@@ -485,8 +512,13 @@ void UI_Task(void)
 			nav_stable_count = 0;
 		}
 
+		/* 目标尚未锁定，先判断手指落在哪个区域。 */
 		if(!touch_target_locked)
 		{
+			/*
+			 * 判断是否点中摄像头画面区域（网络页面除外）。
+			 * 命中后直接锁定，等待抬起时做“双击缩放”判定。
+			 */
 			camera_tap_candidate =
 				(current_page != UI_PAGE_NETWORK) &&
 				(tp_dev.x[0] >= CAMERA_X) &&
@@ -499,7 +531,12 @@ void UI_Task(void)
 			}
 			else
 			{
+				/* 未命中摄像头，则按控件区域做命中测试。 */
 				key = UI_HitTest(tp_dev.x[0], tp_dev.y[0]);
+				/*
+				 * 顶部标签页（控制/数据/网络）紧邻触摸屏边缘，
+				 * 采用“连续两帧命中同一标签才锁定”的防误触机制。
+				 */
 				if(key >= UI_KEY_TAB_CTRL)
 				{
 					if(key == nav_candidate)
@@ -528,9 +565,14 @@ void UI_Task(void)
 	}
 	else
 	{
+		/* 手指已抬起：结束本次触摸并派发事件。 */
 		if(touch_was_down)
 		{
 			touch_was_down = 0;
+			/*
+			 * 若本次触摸锁定的目标是摄像头区域，则根据两次
+			 * 单击的时间间隔判断是否为双击，双击则切换画面缩放。
+			 */
 			if(touch_target_locked && camera_tap_candidate)
 			{
 				u32 now = EXTIX_GetMillis();
@@ -542,34 +584,41 @@ void UI_Task(void)
 				}
 				else
 				{
+					/* 记录第一次单击时刻，等待可能的第二次单击。 */
 					camera_tap_pending = 1;
 					camera_last_tap_ms = now;
 				}
 			}
+			/* 清除本次触摸的全部临时状态。 */
 			camera_tap_candidate = 0;
 			touch_target_locked = 0;
 			nav_candidate = UI_KEY_NONE;
 			nav_stable_count = 0;
 		}
 
+		/*
+		 * 若有被按下的按键，将按键转换为事件放入事件队列，
+		 * 并恢复按键的抬起绘制、执行相应的动作。
+		 */
 		if(pressed_key != UI_KEY_NONE)
 		{
 			pending_event = UI_KeyToEvent(pressed_key);
 			if(pressed_key >= UI_KEY_UP && pressed_key <= UI_KEY_RIGHT)
-				UI_DrawDirectionKey(pressed_key, 0);
+				UI_DrawDirectionKey(pressed_key, 0);   /* 方向键：恢复未按下样式 */
 			else if(pressed_key == UI_KEY_AVOID)
 			{
+				/* 避障按钮：切换避障开关并刷新按钮与状态显示。 */
 				avoid_enabled = !avoid_enabled;
 				UI_DrawAvoidButton(0);
 				UI_DrawAvoidStatus();
 			}
 			else if(pressed_key == UI_KEY_TAB_CTRL)
-				UI_SwitchPage(UI_PAGE_CONTROL);
+				UI_SwitchPage(UI_PAGE_CONTROL);   /* 标签页：切换到控制页 */
 			else if(pressed_key == UI_KEY_TAB_DATA)
-				UI_SwitchPage(UI_PAGE_DATA);
+				UI_SwitchPage(UI_PAGE_DATA);      /* 标签页：切换到数据页 */
 			else if(pressed_key == UI_KEY_TAB_NET)
-				UI_SwitchPage(UI_PAGE_NETWORK);
-			pressed_key = UI_KEY_NONE;
+				UI_SwitchPage(UI_PAGE_NETWORK);   /* 标签页：切换到网络页 */
+			pressed_key = UI_KEY_NONE;            /* 本次按键处理完毕 */
 		}
 	}
 }

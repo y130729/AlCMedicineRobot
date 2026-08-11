@@ -48,17 +48,17 @@ extern void vTaskCarControl(void *pvParameters);
 /* ============================ 钩子函数 ============================ */
 void vApplicationMallocFailedHook(void)
 {
-	/* 堆内存耗尽: 点亮 LED1 并停在这里, 便于发现内存不足 */
-	LED1 = 0;
+	/* 堆内存耗尽: 点亮 LED2 并停在这里, 便于发现内存不足 */
+	LED2 = 0;
 	for(;;) {}
 }
 
 void vApplicationStackOverflowHook(TaskHandle_t xTask, char *pcTaskName)
 {
-	/* 任务栈溢出: 点亮 LED1 并停在这里 */
+	/* 任务栈溢出: 点亮 LED2 并停在这里 */
 	(void)xTask;
 	(void)pcTaskName;
-	LED1 = 0;
+	LED2 = 0;
 	for(;;) {}
 }
 

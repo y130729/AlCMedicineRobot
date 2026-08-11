@@ -73,7 +73,7 @@ AIC_MedRobot_stm32f407/
 | **TFT-LCD**      | FSMC      | 显示与触摸交互               |
 | **电机驱动**     | TIM PWM   | 方向 + 速度控制              |
 | **HC-SR04 超声波** | GPIO + TIM | 测距避障                    |
-| **ADC 循迹**     | ADC1      | 3 路模拟输入 (左/中/右)      |
+| **ADC 循迹**     | ADC3      | 3 路模拟输入 (左=PF7/中=PF6/右=PF5) |
 
 ## 软件架构
 
@@ -158,10 +158,12 @@ AIC_MedRobot_stm32f407/
 
 ### 硬件引脚冲突（需核对实物接线）
 
-1. **PC5 复用冲突**：`ADC3_IN15`（右循迹传感器，`main.c` 中 `adcR`）与右电机方向引脚 PC5（`HARDWARE/MOTOR/motor.c`）共用同一引脚，二者无法同时正常工作，右传感器读数会被电机输出电平污染。需核对板卡接线，将右电机方向脚或右传感器改接至其他空闲引脚。
-2. **PF5 无效配置**：`Adc_Init()` 将 PF5 配置为模拟输入，但 STM32F407 的 ADC3 没有 PF5 通道；实际右传感器读取的是 PC5（ADC3_CH15），与源码注释不符。
-3. **LED1(PF9) 与 TIM14 PWM 复用**：PF9 已被右电机 PWM（TIM14_CH1）占用，LED1 指示灯失效。运行指示灯已改为 LED2（PF10）。
-4. **PB8/PB9 复用**：KEY1/KEY0（EXTI）与 24CXX EEPROM 软件 IIC 共用 PB8/PB9。电容屏方案未使用 24CXX，但启用电阻屏校准存储时会与按键冲突。
+1. **LED1(PF9) 与 TIM14 PWM 复用**：PF9 已被右电机 PWM（TIM14_CH1）占用，LED1 指示灯失效；RTOS 堆/栈错误钩子已改用 LED2（PF10）指示。
+2. **PB8/PB9 复用**：KEY1/KEY0（EXTI）与 24CXX EEPROM 软件 IIC 共用 PB8/PB9。电容屏方案未使用 24CXX，但启用电阻屏校准存储时会与按键冲突。
+
+> 循迹 ADC 通道核对（依据 STM32F407 官方 CubeMX 数据库）：左=PF7(ADC3_CH5)、
+> 中=PF6(ADC3_CH4)、右=PF5(ADC3_CH15)，与 `adc.c`/`car_app.c` 代码一致；
+> PC5 是 ADC1/ADC2 的 IN15，与 ADC3 无关，不存在 PC5 复用冲突。
 
 ### 已修复/优化的软件问题
 
@@ -434,10 +436,10 @@ __asm void PendSV_Handler(void)
 
 ### 10. 钩子与错误处理
 
-- `vApplicationMallocFailedHook()`：堆耗尽 → 点亮 LED1 并停机。
+- `vApplicationMallocFailedHook()`：堆耗尽 → 点亮 LED2 并停机。
 - `vApplicationStackOverflowHook()`：任务栈溢出（`configCHECK_FOR_STACK_OVERFLOW=2`）
-  → 点亮 LED1 并停机。
-- 调试建议：若上电后 LED1 常亮，说明堆/栈配置不足，优先检查第 8 节预算。
+  → 点亮 LED2 并停机。
+- 调试建议：若上电后 LED2 常亮，说明堆/栈配置不足，优先检查第 8 节预算。
 
 ---
 
@@ -463,7 +465,7 @@ __asm void PendSV_Handler(void)
 1. 修改 `RTOS\rtos_conf.h` 中 `RTOS_ENABLE` 为 1 或 0。
 2. 用 Keil 打开 `USER\AIC_MedRobot.uvproj` 重新编译下载。
 3. RTOS 模式运行表现：小车行为与裸机一致，但超声波测距的 30ms 等待期间
-   UI/图传/WiFi 依然流畅运行；LED1 常亮表示堆/栈异常。
+   UI/图传/WiFi 依然流畅运行；LED2 常亮表示堆/栈异常。
 
 ---
 
