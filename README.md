@@ -156,10 +156,10 @@ AIC_MedRobot_stm32f407/
 
 ## 已知问题与注意事项
 
-### 硬件引脚冲突（需核对实物接线）
+### 硬件资源占用说明（已核对）
 
-1. **LED1(PF9) 与 TIM14 PWM 复用**：PF9 已被右电机 PWM（TIM14_CH1）占用，LED1 指示灯失效；RTOS 堆/栈错误钩子已改用 LED2（PF10）指示。
-2. **PB8/PB9 复用**：KEY1/KEY0（EXTI）与 24CXX EEPROM 软件 IIC 共用 PB8/PB9。电容屏方案未使用 24CXX，但启用电阻屏校准存储时会与按键冲突。
+- **PF9（LED1/D1）由 TIM14 右电机 PWM 独占**：`LED_Init()` 已不再配置 PF9，指示灯统一使用 PF10（LED2/D2）；D1 因引脚被 PWM 占用在硬件上不可用，`led.h` 中 `LED1` 宏仅作引脚记录，请勿使用。
+- **PB8/PB9 为按键 EXTI 输入**：KEY1(PB8)/KEY0(PB9) 下降沿触发（`EXTIX_Init`）；24CXX 软件 IIC（`AT24CXX_Init`）仅在 `TP_Init()` 电阻屏分支初始化。本工程使用电容屏（GT9147/OTT2001A），不初始化 24CXX，无实际冲突；若后续改用电阻屏，需重新评估按键与校准存储的引脚复用。
 
 > 循迹 ADC 通道核对（依据 STM32F407 官方 CubeMX 数据库）：左=PF7(ADC3_CH5)、
 > 中=PF6(ADC3_CH4)、右=PF5(ADC3_CH15)，与 `adc.c`/`car_app.c` 代码一致；
@@ -172,6 +172,7 @@ AIC_MedRobot_stm32f407/
 - **USART2 中断优先级越界修正**：`NVIC_PriorityGroup_2` 下抢占优先级范围 0~3，原配置 4/5 被静默截断为最高优先级，已改为 3/2。
 - **JPEG 帧缓冲越界防护**：帧头/CRC 写入与 `memmove` 增加边界检查，防止 JPEG 填满缓冲时越界写。
 - **JPEG 模式下摄像头遮挡检测**：JPEG 模式时 `camera_frame`（RGB565 预览缓冲）不再更新，原遮挡/颜色检测基于陈旧数据。现增加基于 JPEG 帧大小的遮挡启发式检测（阈值 `JPEG_OCCLUSION_SIZE_THRESHOLD`，按实际场景调整），并停止刷新陈旧的预览画面。
+- **`LED_Init()` 不再配置 PF9**：PF9 已由 TIM14 右电机 PWM（TIM14_CH1）独占，LED1(D1) 硬件上不可用；现仅初始化 PF10（LED2），消除 LED 初始化对 PWM 引脚的潜在覆写。
 
 ### 仍待优化
 

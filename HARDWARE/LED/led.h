@@ -11,7 +11,7 @@
 
 
 //LED端口定义
-#define LED1 PFout(9)	  // D1
+#define LED1 PFout(9)	  // D1（PF9已被TIM14 PWM占用，固件不可用）
 #define LED2 PFout(10)	// D2	 
 
 void LED_Init(void);//初始化		 				    
