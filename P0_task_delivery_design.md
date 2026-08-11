@@ -1,6 +1,6 @@
 # P0 任务配送闭环设计方案（录入任务 -> 配送到目的地）
 
-> 文档版本：v1.0 | 适用项目：AIC_MedRobot_stm32f407 + AICMedicineRobotSystem | 状态：设计稿，待实施
+> 文档版本：v1.1 | 适用项目：AIC_MedRobot_stm32f407 + AICMedicineRobotSystem | 状态：M1~M3 已编码落地，待实车联调
 
 ## 1. 方案概述与架构原则
 
@@ -53,7 +53,7 @@
 | 命令确认 | `ACK,<task_id>,<0\|1>` | 收到命令即回；1=成功 0=拒绝 |
 | 进识别区 | `ENTER_STATION,<task_id>,<seq>` | 编码带触发，请开启识别窗口 |
 | 状态上报 | `STATUS,<task_id>,<state>` | state: `NAV/APPROACH/STOPPED/WAIT_LOAD/WAIT_UNLOAD/PAUSED/TIMEOUT` |
-| 到达停车 | `TASK_ARRIVE,<task_id>,<station_id>` | 已停稳，等待确认 |
+| 到达停车 | `TASK_ARRIVE,<task_id>,<station_id>[,FALLBACK]` | 已停稳，等待确认；带 `FALLBACK` 表示兜底停车（未自动识别），弹窗可人工确认 |
 | 任务完成 | `TASK_DONE,<task_id>` | 卸药确认后发送 |
 | 心跳 | `HEARTBEAT,<battery>,<state>` | 每 1s 一次，更新电量/在线状态 |
 
@@ -86,7 +86,8 @@ t0  触发带命中 -> 降速 + 上报 ENTER_STATION
 t1  收到 STOP,<task_id>,<station_id>（校验 task_id 且站点匹配目标）-> MOTOR_Stop()
     -> 上报 STATUS,STOPPED -> TASK_ARRIVE
 兜底：t0 后 2000ms（或约 30cm）未收到 STOP -> 强制 MOTOR_Stop()
-    -> 上报 STATUS,STATION_UNCONFIRMED -> 停车等待人工
+     -> 补发 TASK_ARRIVE,<task_id>,<station_id>,FALLBACK + STATUS,TIMEOUT
+     -> 停车等待人工（上位机弹窗可人工确认）
 ```
 
 - 只有**目标站点**的 `STOP` 才执行停车，路径上经过的其他站点继续走。
@@ -130,12 +131,13 @@ t1  收到 STOP,<task_id>,<station_id>（校验 task_id 且站点匹配目标）
 
 - 将 quirc 源码加入 `AICMedicineRobotSystem.pro`（纯 C、无依赖，Windows/Linux 双平台可编译）；所需文件可以上网下载
 - 流程：收到 `ENTER_STATION` -> 开启 **2s 识别窗口** -> 对窗口内每帧 JPEG（`QPixmap -> QImage -> 灰度`）尝试解码 -> 命中目标站点即发 `STOP` 并关闭窗口；
+- 已实现（M3）：`quirc/` 目录随工程提供（ISC 许可），`.pro` 自动接入；`tryDecodeQR()` 将 `QImage` 转灰度后逐行拷入 quirc 缓冲，解码命中返回文本；
 - 窗口超时未命中：静默重开一轮，再失败则提示「站点未确认」（车端此时已兜底停车）；
 - 去重：同一站点连续命中只发一次；非目标站点命中只记日志不动作。
 
 ### 5.2 二维码规格
 
-- 内容：`S1/S2...` 加 1 字节校验位；
+- 内容：`S1/S2...` 加 1 字节校验位；上位机按「站点前缀 + 至多 1 字节」匹配，兼容无校验位贴纸；
 - 贴纸 3~5cm，识别区做 20~30cm 长（同 ID 多贴或长条）；
 - 车速 10cm/s 时，0.5~1s 延迟窗口内车只走 5~10cm，稳定落在识别区内。
 
@@ -177,7 +179,7 @@ t1  收到 STOP,<task_id>,<station_id>（校验 task_id 且站点匹配目标）
 | --- | --- | --- |
 | M1 协议握手 | `TASK_START` 下发 + `ACK` + 周期 `STATUS` + 重发机制 | 日志见完整握手、断线重发 |
 | M2 车端跑通 | 触发带检测、降速、STOP 停车、任务状态机（识别暂用命令模拟确认） | 全链路跑通但未接识别 |
-| M3 上位机识别 | quirc 接入、识别窗口、`ENTER_STATION`/`STOP` 闭环 | 实车到站自动停车，实测贴纸/车速/距离 |
+| M3 上位机识别 | quirc 接入、识别窗口、`ENTER_STATION`/`STOP` 闭环（代码已落地） | 待实车贴纸联调：实测车速/距离/识别率 |
 | M4 收尾 | 装/卸确认弹窗、心跳电量、超时与异常分支、断线提示 | 完整演示脚本可复现 |
 
 ## 8. 风险与对策

@@ -189,7 +189,7 @@ AIC_MedRobot_stm32f407/
 #### 📦 任务配送（P0 闭环）
 - 状态机：`TASK_IDLE → NAV_TO_LOAD → APPROACH_LOAD → WAIT_LOAD → NAV_TO_WARD → APPROACH_WARD → WAIT_UNLOAD → DONE`
 - 进站触发：左中右三路同时 ≥2000 且连续 10 个采样周期（约 20ms）→ 降速至 PWM 200 → 上报 `ENTER_STATION`
-- 停车：收到目标站点 `STOP` 且校验通过后停车，上报 `TASK_ARRIVE`；2s 内未收到 `STOP` 强制停车（兜底，上报 TIMEOUT）
+- 停车：收到目标站点 `STOP` 且校验通过后停车，上报 `TASK_ARRIVE`；2s 内未收到 `STOP` 强制停车（兜底，补发 `TASK_ARRIVE,<task>,<站>,FALLBACK` 并报 `STATUS,TIMEOUT`，上位机弹窗可人工确认）
 - 超时：每段循迹 5 分钟超时中止；装/卸确认 5 分钟超时 LED2 闪烁告警（蜂鸣器 PF8 已被 TIM13 PWM 占用，不可用）
 - 车端触摸确认：控制页「确认装药/确认取药」按钮按下等效 `TASK_CONFIRM`（装药→导航病房，取药→`TASK_DONE` 回 IDLE），WiFi 断链也能现场交接
 - 心跳：每 1s 上报电量与任务状态（电量暂为固定值 100，预留电池采样扩展）

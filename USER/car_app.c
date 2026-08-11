@@ -480,6 +480,9 @@ static void CAR_StepTask(CAR_Ctx *ctx)
 				g_task.state = TASK_WAIT_UNLOAD;
 				g_task.wait_start_ms = now;
 			}
+			/* 补发到达信号(带 FALLBACK 标记), 上位机弹窗可走人工确认 */
+			u3_printf("TASK_ARRIVE,%s,%s,FALLBACK\r\n",
+				g_task.task_id, CAR_TaskTargetStation());
 			u3_printf("STATUS,%s,TIMEOUT\r\n", g_task.task_id);
 		}
 		break;
