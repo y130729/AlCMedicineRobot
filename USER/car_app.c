@@ -394,6 +394,44 @@ static u8 CAR_TaskApproaching(void)
 static void CAR_StepTask(CAR_Ctx *ctx)
 {
 	u32 now = EXTIX_GetMillis();
+	/* 车端触摸确认: 同步按钮状态(等待装/卸确认时有效), 轮询触摸请求, 等效 TASK_CONFIRM */
+	{
+		u8 confirm = UI_CONFIRM_NONE;
+		u8 req;
+
+		if (g_task.state == TASK_WAIT_LOAD)
+			confirm = UI_CONFIRM_LOAD;
+		else if (g_task.state == TASK_WAIT_UNLOAD)
+			confirm = UI_CONFIRM_UNLOAD;
+		RTOS_LcdLock();
+		UI_SetTaskConfirm(confirm);
+		RTOS_LcdUnlock();
+
+		req = UI_GetConfirmRequested();
+		if (req != UI_CONFIRM_NONE)
+		{
+			UI_ClearConfirmRequest();
+			if (req == UI_CONFIRM_LOAD && g_task.state == TASK_WAIT_LOAD)
+			{
+				/* 装药确认: 出发前往病房 */
+				g_task.seq = 1;
+				g_task.waiting_stop = 0;
+				g_task.trigger_cnt = 0;
+				g_task.state = TASK_NAV_TO_WARD;
+				g_task.nav_start_ms = EXTIX_GetMillis();
+				ctx->line_enabled = 1;
+				u3_printf("STATUS,%s,NAV\r\n", g_task.task_id);
+			}
+			else if (req == UI_CONFIRM_UNLOAD && g_task.state == TASK_WAIT_UNLOAD)
+			{
+				/* 取药确认: 任务完成回 IDLE */
+				u3_printf("TASK_DONE,%s\r\n", g_task.task_id);
+				g_task.state = TASK_IDLE;
+				g_task.task_id[0] = 0;
+				ctx->line_enabled = 0;
+			}
+		}
+	}
 
 	/* 心跳: 每 1s 上报电量与任务状态(上位机据此刷新电量/在线) */
 	if ((s32)(now - g_task.last_heartbeat_ms) >= TASK_HEARTBEAT_MS)

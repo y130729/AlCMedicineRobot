@@ -16,18 +16,18 @@
 typedef enum
 {
 	UI_KEY_NONE = 0,
-	UI_KEY_UP,
-	UI_KEY_DOWN,
-	UI_KEY_LEFT,
-	UI_KEY_RIGHT,
 	UI_KEY_AVOID,
+	UI_KEY_CONFIRM_LOAD,
+	UI_KEY_CONFIRM_UNLOAD,
 	UI_KEY_TAB_CTRL,
 	UI_KEY_TAB_DATA,
 	UI_KEY_TAB_NET
 } UI_Key;
 
 static UI_Key pressed_key = UI_KEY_NONE;
-static UI_Event pending_event = UI_EVENT_NONE;
+static u8 confirm_action = UI_CONFIRM_NONE;
+static u8 drawn_confirm_action = 0xFF;
+static u8 confirm_requested = UI_CONFIRM_NONE;
 static UI_Page current_page = UI_PAGE_CONTROL;
 static u8 avoid_enabled = 1;
 static u8 obstacle_present = 0;
@@ -69,6 +69,8 @@ static const u8 text_net[]         = {ZH_WANG,ZH_LUO,ZH_END};
 static const u8 text_brightness[]  = {ZH_LIANG,ZH_DU,ZH_END};
 static const u8 text_contrast[]    = {ZH_DUI,ZH_BI_COMPARE,ZH_DU,ZH_END};
 static const u8 text_saturation[]  = {ZH_SE,ZH_DU,ZH_END};
+	static const u8 text_confirm_load[]    = {ZH_QUE,ZH_REN,ZH_ZHUANG,ZH_YAO,ZH_END};
+	static const u8 text_confirm_unload[]  = {ZH_QUE,ZH_REN,ZH_QU,ZH_YAO,ZH_END};
 
 static void UI_ShowText(u16 x, u16 y, u16 color, u16 back, u8 *text)
 {
@@ -164,33 +166,43 @@ static void UI_DrawTabs(UI_Key down_key)
 	UI_ShowZh(184, 298, t2, c2, text_net);
 }
 
-static void UI_DrawDirectionKey(UI_Key key, u8 down)
+static void UI_DrawConfirmButton(UI_Key key, u8 down)
 {
-	switch(key)
+	u16 y1;
+	u16 y2;
+	u16 fill;
+	u16 tcolor;
+	u8 active;
+	const u8 *text;
+
+	if(key == UI_KEY_CONFIRM_LOAD)
 	{
-		case UI_KEY_UP:
-			if(down) LCD_UpButtonDown(); else LCD_UpButtonUp();
-			break;
-		case UI_KEY_DOWN:
-			if(down) LCD_DownButtonDown(); else LCD_DownButtonUp();
-			break;
-		case UI_KEY_LEFT:
-			if(down) LCD_LeftButtonDown(); else LCD_LeftButtonUp();
-			break;
-		case UI_KEY_RIGHT:
-			if(down) LCD_RightButtonDown(); else LCD_RightButtonUp();
-			break;
-		default:
-			break;
+		y1 = 194;
+		y2 = 240;
+		text = text_confirm_load;
+		active = (confirm_action == UI_CONFIRM_LOAD);
 	}
+	else
+	{
+		y1 = 244;
+		y2 = 288;
+		text = text_confirm_unload;
+		active = (confirm_action == UI_CONFIRM_UNLOAD);
+	}
+	fill = down ? GRAYBLUE : UI_DARK;
+	tcolor = down ? BLACK : (active ? WHITE : GRAY);
+	LCD_Fill(12, y1, 108, y2, fill);
+	POINT_COLOR = down ? BLACK : WHITE;
+	LCD_DrawRectangle(12, y1, 108, y2);
+	UI_ShowZh(28, y1 + 15, tcolor, fill, text);
 }
 
 static void UI_DrawPressedKey(UI_Key key)
 {
-	if(key >= UI_KEY_UP && key <= UI_KEY_RIGHT)
-		UI_DrawDirectionKey(key, 1);
-	else if(key == UI_KEY_AVOID)
+	if(key == UI_KEY_AVOID)
 		UI_DrawAvoidButton(1);
+	else if(key == UI_KEY_CONFIRM_LOAD || key == UI_KEY_CONFIRM_UNLOAD)
+		UI_DrawConfirmButton(key, 1);
 	else if(key >= UI_KEY_TAB_CTRL)
 		UI_DrawTabs(key);
 }
@@ -201,29 +213,12 @@ static UI_Key UI_HitTest(u16 x, u16 y)
 	if(y >= 289 && x < 160) return UI_KEY_TAB_DATA;
 	if(y >= 289) return UI_KEY_TAB_NET;
 	if(current_page != UI_PAGE_CONTROL) return UI_KEY_NONE;
-	if(x >= 44 && x <= 76 && y >= 194 && y <= 224) return UI_KEY_UP;
-	if(x >= 44 && x <= 76 && y >= 256 && y <= 286) return UI_KEY_DOWN;
-	if(x >= 12 && x <= 43 && y >= 225 && y <= 255) return UI_KEY_LEFT;
-	if(x >= 77 && x <= 108 && y >= 225 && y <= 255) return UI_KEY_RIGHT;
+	if(x >= 12 && x <= 108 && y >= 194 && y <= 240) return UI_KEY_CONFIRM_LOAD;
+	if(x >= 12 && x <= 108 && y >= 244 && y <= 288) return UI_KEY_CONFIRM_UNLOAD;
 	if(x >= 112 && x <= 237 && y >= 243 && y <= 281) return UI_KEY_AVOID;
 	return UI_KEY_NONE;
 }
 
-static UI_Event UI_KeyToEvent(UI_Key key)
-{
-	switch(key)
-	{
-		case UI_KEY_UP: return UI_EVENT_UP;
-		case UI_KEY_DOWN: return UI_EVENT_DOWN;
-		case UI_KEY_LEFT: return UI_EVENT_LEFT;
-		case UI_KEY_RIGHT: return UI_EVENT_RIGHT;
-		case UI_KEY_AVOID: return UI_EVENT_AVOID_TOGGLE;
-		case UI_KEY_TAB_CTRL: return UI_EVENT_TAB_CTRL;
-		case UI_KEY_TAB_DATA: return UI_EVENT_TAB_DATA;
-		case UI_KEY_TAB_NET: return UI_EVENT_TAB_NET;
-		default: return UI_EVENT_NONE;
-	}
-}
 
 static void UI_DrawHeader(void)
 {
@@ -285,14 +280,9 @@ static void UI_DrawControlPage(void)
 	UI_ShowText(94, 110, GRAY, BLACK, "CAM 01");
 
 	LCD_Fill(0, 189, 239, 288, UI_PANEL);
-	LCD_UpButtonUp();
-	LCD_DownButtonUp();
-	LCD_LeftButtonUp();
-	LCD_RightButtonUp();
-	LCD_Fill(44, 225, 76, 255, UI_DARK);
-	POINT_COLOR = UI_BORDER;
-	LCD_DrawRectangle(44, 225, 76, 255);
-	UI_ShowText(57, 232, RED, UI_DARK, "S");
+	drawn_confirm_action = 0xFF;
+	UI_DrawConfirmButton(UI_KEY_CONFIRM_LOAD, 0);
+	UI_DrawConfirmButton(UI_KEY_CONFIRM_UNLOAD, 0);
 
 	UI_DrawAvoidStatus();
 	UI_DrawAvoidButton(0);
@@ -636,20 +626,26 @@ void UI_Task(void)
 		}
 
 		/*
-		 * 若有被按下的按键，将按键转换为事件放入事件队列，
-		 * 并恢复按键的抬起绘制、执行相应的动作。
+		 * 若有被按下的按键，执行相应动作并恢复按键抬起绘制。
 		 */
 		if(pressed_key != UI_KEY_NONE)
 		{
-			pending_event = UI_KeyToEvent(pressed_key);
-			if(pressed_key >= UI_KEY_UP && pressed_key <= UI_KEY_RIGHT)
-				UI_DrawDirectionKey(pressed_key, 0);   /* 方向键：恢复未按下样式 */
-			else if(pressed_key == UI_KEY_AVOID)
+			if(pressed_key == UI_KEY_AVOID)
 			{
 				/* 避障按钮：切换避障开关并刷新按钮与状态显示。 */
 				avoid_enabled = !avoid_enabled;
 				UI_DrawAvoidButton(0);
 				UI_DrawAvoidStatus();
+			}
+			else if(pressed_key == UI_KEY_CONFIRM_LOAD ||
+					pressed_key == UI_KEY_CONFIRM_UNLOAD)
+			{
+				/* 装卸确认按钮：任务等待对应确认时置触摸请求。 */
+				u8 act = (pressed_key == UI_KEY_CONFIRM_LOAD) ?
+					UI_CONFIRM_LOAD : UI_CONFIRM_UNLOAD;
+				UI_DrawConfirmButton(pressed_key, 0);
+				if(act == confirm_action)
+					confirm_requested = act;
 			}
 			else if(pressed_key == UI_KEY_TAB_CTRL)
 				UI_SwitchPage(UI_PAGE_CONTROL);   /* 标签页：切换到控制页 */
@@ -662,9 +658,22 @@ void UI_Task(void)
 	}
 }
 
-UI_Event UI_GetEvent(void)
+void UI_SetTaskConfirm(u8 action)
 {
-	UI_Event event = pending_event;
-	pending_event = UI_EVENT_NONE;
-	return event;
+	confirm_action = action;
+	if(current_page != UI_PAGE_CONTROL) return;
+	if(drawn_confirm_action == action) return;
+	drawn_confirm_action = action;
+	UI_DrawConfirmButton(UI_KEY_CONFIRM_LOAD, 0);
+	UI_DrawConfirmButton(UI_KEY_CONFIRM_UNLOAD, 0);
+}
+
+u8 UI_GetConfirmRequested(void)
+{
+	return confirm_requested;
+}
+
+void UI_ClearConfirmRequest(void)
+{
+	confirm_requested = UI_CONFIRM_NONE;
 }
