@@ -30,6 +30,7 @@ void UI_SetObstacle(u8 present);
 u8 UI_IsAvoidEnabled(void);
 UI_Event UI_GetEvent(void);
 UI_Page UI_GetPage(void);
-void UI_SetColorRecognition(u32 red_count, u32 green_count, u8 result);
+void UI_SetLineSensors(u16 l, u16 m, u16 r);
+void UI_SetMotionState(const char *state, u16 pwmval);
 
 #endif

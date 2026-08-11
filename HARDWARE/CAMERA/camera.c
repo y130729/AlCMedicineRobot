@@ -7,7 +7,6 @@
 #include "wifi_transfer.h"
 
 #define CAMERA_REFRESH_MS 100
-#define COLOR_RECOGNITION_MS 250
 #define OCCLUSION_GRAD_THRESHOLD 3
 #define OCCLUSION_VAR_THRESHOLD 30
 #define OCCLUSION_CLEAR_GRAD_THRESHOLD 6
@@ -20,10 +19,6 @@ static u16 camera_frame[CAMERA_HEIGHT][CAMERA_WIDTH];
 static u8 camera_ready = 0;
 static u8 displayed_frame = 0;
 static u32 next_refresh_ms = 0;
-static u32 next_recognition_ms = 0;
-static u32 camera_red_count = 0;
-static u32 camera_green_count = 0;
-static CAMERA_ColorResult camera_color_result = CAMERA_COLOR_UNCLEAR;
 static u8 camera_zoomed = 0;
 static u16 zoom_line[CAMERA_WIDTH];
 static u16 zoom_source_x[CAMERA_WIDTH];
@@ -255,53 +250,6 @@ static void CAMERA_DisplayZoomed(u8 avoid_menu)
 	}
 }
 
-static void CAMERA_RecognizeColor(void)
-{
-	u16 row;
-	u16 col;
-	u16 pixel;
-	u8 red;
-	u8 green;
-	u8 blue;
-	u32 red_count = 0;
-	u32 green_count = 0;
-
-	/* 沿用 red_green_recognition_temp 的 RGB565 阈值识别逻辑。 */
-	for(row = 0; row < CAMERA_HEIGHT; row++)
-	{
-		for(col = 0; col < CAMERA_WIDTH; col++)
-		{
-			pixel = camera_frame[row][col];
-			red = (u8)(((pixel & 0XF800) >> 11) << 3);
-			green = (u8)(((pixel & 0X07E0) >> 5) << 2);
-			blue = (u8)((pixel & 0X001F) << 3);
-			if(red > 150 && green < 100 && blue < 100)
-				red_count++;
-			else if(green > 150 && red < 100 && blue < 100)
-				green_count++;
-		}
-	}
-
-	camera_red_count = red_count;
-	camera_green_count = green_count;
-	if(red_count * 5 > green_count * 6)
-		camera_color_result = CAMERA_COLOR_RED;
-	else if(green_count * 5 > red_count * 6)
-		camera_color_result = CAMERA_COLOR_GREEN;
-	else
-		camera_color_result = CAMERA_COLOR_UNCLEAR;
-	UI_SetColorRecognition(camera_red_count, camera_green_count,
-	                       (u8)camera_color_result);
-}
-
-void CAMERA_GetColorRecognition(u32 *red_count, u32 *green_count,
-	                            CAMERA_ColorResult *result)
-{
-	*red_count = camera_red_count;
-	*green_count = camera_green_count;
-	*result = camera_color_result;
-}
-
 static void CAMERA_ShowMessage(const char *message, u16 color)
 {
 	LCD_Fill(CAMERA_X, CAMERA_Y,
@@ -374,11 +322,6 @@ void CAMERA_Task(u32 now_ms)
 	else
 	{
 		CAMERA_DetectOcclusion();/*使用普通版本的遮挡检测*/
-		if((s32)(now_ms - next_recognition_ms) >= 0)
-		{
-			CAMERA_RecognizeColor();
-			next_recognition_ms = now_ms + COLOR_RECOGNITION_MS;
-		}
 	}
 	
 	if(camera_jpeg_mode)

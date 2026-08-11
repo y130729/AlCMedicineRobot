@@ -1,4 +1,5 @@
 #include "ui.h"
+#include <string.h>
 #include "lcd.h"
 #include "touch.h"
 #include "ui_zh_font.h"
@@ -32,12 +33,16 @@ static u8 avoid_enabled = 1;
 static u8 obstacle_present = 0;
 static u16 last_distance = 0xFFFF;
 static float saved_distance_cm = 0.0f;
-static u32 color_red_count = 0;
-static u32 color_green_count = 0;
-static u8 color_result = 0;
-static u32 drawn_red_count = 0XFFFFFFFF;
-static u32 drawn_green_count = 0XFFFFFFFF;
-static u8 drawn_color_result = 0XFF;
+static u16 line_l = 0;
+static u16 line_m = 0;
+static u16 line_r = 0;
+static u16 drawn_line_l = 0XFFFF;
+static u16 drawn_line_m = 0XFFFF;
+static u16 drawn_line_r = 0XFFFF;
+static u8 motion_state_text[12] = "STANDBY";
+static u16 motion_pwm = 0;
+static u8 drawn_motion_text[12] = "";
+static u16 drawn_motion_pwm = 0XFFFF;
 static u8 image_settings_drawn = 0;
 static u8 image_settings_applied = 0;
 static u8 drawn_image_param = IMAGE_PARAM_BRIGHTNESS;
@@ -228,34 +233,45 @@ static void UI_DrawHeader(void)
 	LCD_Fill(220, 7, 227, 14, GREEN);
 }
 
-static void UI_DrawColorRecognition(void)
+static void UI_DrawLineSensors(void)
 {
-	if(color_red_count != drawn_red_count)
+	if(line_l != drawn_line_l)
 	{
-		POINT_COLOR = RED;
+		POINT_COLOR = WHITE;
 		BACK_COLOR = UI_PANEL;
-		LCD_ShowNum(42, 207, color_red_count, 5, 16);
-		drawn_red_count = color_red_count;
+		LCD_ShowNum(30, 207, line_l, 4, 16);
+		drawn_line_l = line_l;
 	}
-	if(color_green_count != drawn_green_count)
+	if(line_m != drawn_line_m)
 	{
-		POINT_COLOR = GREEN;
+		POINT_COLOR = WHITE;
 		BACK_COLOR = UI_PANEL;
-		LCD_ShowNum(154, 207, color_green_count, 5, 16);
-		drawn_green_count = color_green_count;
+		LCD_ShowNum(94, 207, line_m, 4, 16);
+		drawn_line_m = line_m;
 	}
-	if(color_result != drawn_color_result)
+	if(line_r != drawn_line_r)
 	{
-		LCD_Fill(10, 238, 229, 278, UI_PANEL);
-		UI_ShowText(70, 239, LIGHTBLUE, UI_PANEL, "MAIN COLOR");
-		if(color_result == 1)
-			UI_ShowText(104, 260, RED, UI_PANEL, "RED");
-		else if(color_result == 2)
-			UI_ShowText(94, 260, GREEN, UI_PANEL, "GREEN");
-		else
-			UI_ShowText(88, 260, GRAY, UI_PANEL, "UNCLEAR");
-		drawn_color_result = color_result;
+		POINT_COLOR = WHITE;
+		BACK_COLOR = UI_PANEL;
+		LCD_ShowNum(158, 207, line_r, 4, 16);
+		drawn_line_r = line_r;
 	}
+}
+
+static void UI_DrawMotionState(void)
+{
+	if((strcmp((const char *)drawn_motion_text, (const char *)motion_state_text) == 0) &&
+	   (motion_pwm == drawn_motion_pwm))
+		return;
+	LCD_Fill(10, 240, 235, 264, UI_PANEL);
+	UI_ShowText(10, 242, GRAY, UI_PANEL, "ST:");
+	UI_ShowText(42, 242, WHITE, UI_PANEL, motion_state_text);
+	UI_ShowText(140, 242, GRAY, UI_PANEL, "PWM:");
+	POINT_COLOR = WHITE;
+	BACK_COLOR = UI_PANEL;
+	LCD_ShowNum(176, 242, motion_pwm, 4, 16);
+	strcpy((char *)drawn_motion_text, (const char *)motion_state_text);
+	drawn_motion_pwm = motion_pwm;
 }
 
 static void UI_DrawControlPage(void)
@@ -293,17 +309,21 @@ static void UI_DrawControlPage(void)
 static void UI_DrawDataPage(void)
 {
 	LCD_Fill(0, 24, 239, 288, BLACK);
-	UI_ShowText(72, 27, WHITE, BLACK, "COLOR DATA");
+	UI_ShowText(72, 27, WHITE, BLACK, "DEBUG DATA");
 	POINT_COLOR = UI_BORDER;
 	LCD_DrawRectangle(0, 45, 239, 188);
 	UI_ShowText(94, 110, GRAY, BLACK, "CAM 01");
 	LCD_Fill(0, 189, 239, 288, UI_PANEL);
-	UI_ShowText(18, 207, RED, UI_PANEL, "R:");
-	UI_ShowText(130, 207, GREEN, UI_PANEL, "G:");
-	drawn_red_count = 0XFFFFFFFF;
-	drawn_green_count = 0XFFFFFFFF;
-	drawn_color_result = 0XFF;
-	UI_DrawColorRecognition();
+	UI_ShowText(10, 207, LIGHTBLUE, UI_PANEL, "L:");
+	UI_ShowText(74, 207, LIGHTBLUE, UI_PANEL, "M:");
+	UI_ShowText(138, 207, LIGHTBLUE, UI_PANEL, "R:");
+	drawn_line_l = 0XFFFF;
+	drawn_line_m = 0XFFFF;
+	drawn_line_r = 0XFFFF;
+	UI_DrawLineSensors();
+	drawn_motion_text[0] = '\0';
+	drawn_motion_pwm = 0XFFFF;
+	UI_DrawMotionState();
 	image_settings_drawn = 0;
 	UI_DrawTabs(UI_KEY_NONE);
 }
@@ -404,13 +424,32 @@ UI_Page UI_GetPage(void)
 	return current_page;
 }
 
-void UI_SetColorRecognition(u32 red_count, u32 green_count, u8 result)
+void UI_SetLineSensors(u16 l, u16 m, u16 r)
 {
-	color_red_count = red_count;
-	color_green_count = green_count;
-	color_result = result;
+	line_l = l;
+	line_m = m;
+	line_r = r;
 	if(current_page == UI_PAGE_DATA)
-		UI_DrawColorRecognition();
+		UI_DrawLineSensors();
+}
+
+void UI_SetMotionState(const char *state, u16 pwmval)
+{
+	u8 changed = 0;
+
+	if(strcmp((const char *)motion_state_text, state) != 0)
+	{
+		strncpy((char *)motion_state_text, state, sizeof(motion_state_text) - 1);
+		motion_state_text[sizeof(motion_state_text) - 1] = '\0';
+		changed = 1;
+	}
+	if(motion_pwm != pwmval)
+	{
+		motion_pwm = pwmval;
+		changed = 1;
+	}
+	if(changed && current_page == UI_PAGE_DATA)
+		UI_DrawMotionState();
 }
 
 void UI_Task(void)

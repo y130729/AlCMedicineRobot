@@ -38,6 +38,23 @@ u16 adcL = 0;
 u16 adcM = 0;
 u16 adcR = 0;
 
+/* ==================== 运动状态(供UI数据页显示) ==================== */
+typedef enum
+{
+	CAR_STATE_STOP = 0,          /* 离线/无方向停止 */
+	CAR_STATE_STANDBY,           /* 未使能循迹 */
+	CAR_STATE_STARTUP,           /* 起步加速 */
+	CAR_STATE_FORWARD,           /* 循迹直行 */
+	CAR_STATE_TURN_LEFT,         /* 左转 */
+	CAR_STATE_TURN_RIGHT,        /* 右转 */
+	CAR_STATE_SEARCH_LEFT,       /* 向左搜索 */
+	CAR_STATE_SEARCH_RIGHT,      /* 向右搜索 */
+	CAR_STATE_AVOID_STOP,        /* 避障停车 */
+	CAR_STATE_OCCLUSION_STOP,    /* 遮挡停车 */
+	CAR_STATE_REMOTE             /* 遥控覆盖 */
+} CAR_State;
+
+static u8 g_car_state = CAR_STATE_STOP;
 static void ADC_ReadLineSensors(void)
 {
 	adcL = Get_Adc_Average(ADC_Channel_5, LINE_SAMPLE_TIMES);
@@ -218,10 +235,17 @@ static void CAR_StepRange(CAR_Ctx *ctx)
 	}
 }
 
-/* ---- 步骤6: ADC 采样 + LED 心跳 ---- */
+/* ---- 步骤6: ADC 采样 + LED 心跳 + 数据页刷新 ---- */
 static void CAR_StepAdc(CAR_Ctx *ctx)
 {
+	char state_buf[12];
+
 	ADC_ReadLineSensors();
+	CAR_GetState(state_buf);
+	RTOS_LcdLock();
+	UI_SetLineSensors(adcL, adcM, adcR);
+	UI_SetMotionState(state_buf, ctx->pwmval);
+	RTOS_LcdUnlock();
 	if (EXTIX_GetMillis() >= ctx->next_lcd_ms)
 	{
 		LED2 = !LED2;
@@ -232,50 +256,88 @@ static void CAR_StepAdc(CAR_Ctx *ctx)
 /* ---- 步骤7: 避障/遮挡/遥控暂停 -> 起步加速 -> 循迹逻辑 ---- */
 static void CAR_StepMotion(CAR_Ctx *ctx)
 {
+	u8 state = CAR_STATE_STOP;
+
 	if (ctx->obstacle_active || ctx->camera_occlusion_active || ctx->wifi_override)
 	{
+		if (ctx->wifi_override)
+			state = CAR_STATE_REMOTE;
+		else if (ctx->obstacle_active)
+			state = CAR_STATE_AVOID_STOP;
+		else
+			state = CAR_STATE_OCCLUSION_STOP;
 		if (ctx->obstacle_active || ctx->camera_occlusion_active || !ctx->line_enabled)
 			MOTOR_Stop();
-		return;
 	}
-
 	/* 未收到 startTask 前不执行循迹, 小车保持静止 */
-	if (!ctx->line_enabled)
+	else if (!ctx->line_enabled)
 	{
 		MOTOR_Stop();
-		return;
+		state = CAR_STATE_STANDBY;
 	}
-
-	if ((s32)(ctx->startup_end_ms - EXTIX_GetMillis()) > 0)
+	else if ((s32)(ctx->startup_end_ms - EXTIX_GetMillis()) > 0)
 	{
 		MOTOR_ForwardDual(MOTOR_LEFT_START_SPEED, MOTOR_START_SPEED);
-		return;
+		state = CAR_STATE_STARTUP;
 	}
 	/* 循迹逻辑: 仅在 WiFi 遥控未激活时执行 */
-	if (!LINE_IsBlack(adcL) && !LINE_IsBlack(adcM) && !LINE_IsBlack(adcR))
+	else if (!LINE_IsBlack(adcL) && !LINE_IsBlack(adcM) && !LINE_IsBlack(adcR))
 	{
 		if (ctx->last_direction < 0)
+		{
 			MOTOR_LineSearchLeft();
+			state = CAR_STATE_SEARCH_LEFT;
+		}
 		else if (ctx->last_direction > 0)
+		{
 			MOTOR_LineSearchRight();
+			state = CAR_STATE_SEARCH_RIGHT;
+		}
 		else
+		{
 			MOTOR_Stop();
+			state = CAR_STATE_STOP;
+		}
 	}
 	else if (((u32)adcM + LINE_CENTER_TOLERANCE >= adcL) &&
 	         ((u32)adcM + LINE_CENTER_TOLERANCE >= adcR))
 	{
 		MOTOR_LineForward();
 		ctx->last_direction = 0;
+		state = CAR_STATE_FORWARD;
 	}
 	else if (adcL > adcR)
 	{
 		MOTOR_LineTurnLeft();
 		ctx->last_direction = -1;
+		state = CAR_STATE_TURN_LEFT;
 	}
 	else
 	{
 		MOTOR_LineTurnRight();
 		ctx->last_direction = 1;
+		state = CAR_STATE_TURN_RIGHT;
+	}
+
+	g_car_state = state;
+}
+
+/* ---- 运动状态文本(供 UI 数据页显示) ---- */
+void CAR_GetState(char *buf)
+{
+	switch(g_car_state)
+	{
+	case CAR_STATE_REMOTE:         strcpy(buf, "REMOTE");     break;
+	case CAR_STATE_AVOID_STOP:     strcpy(buf, "AVOID STOP"); break;
+	case CAR_STATE_OCCLUSION_STOP: strcpy(buf, "BLOCK STOP"); break;
+	case CAR_STATE_STARTUP:        strcpy(buf, "STARTING");   break;
+	case CAR_STATE_STANDBY:        strcpy(buf, "STANDBY");    break;
+	case CAR_STATE_FORWARD:        strcpy(buf, "FORWARD");    break;
+	case CAR_STATE_TURN_LEFT:      strcpy(buf, "TURN L");     break;
+	case CAR_STATE_TURN_RIGHT:     strcpy(buf, "TURN R");     break;
+	case CAR_STATE_SEARCH_LEFT:    strcpy(buf, "SEARCH L");   break;
+	case CAR_STATE_SEARCH_RIGHT:   strcpy(buf, "SEARCH R");   break;
+	default:                       strcpy(buf, "STOP");       break;
 	}
 }
 

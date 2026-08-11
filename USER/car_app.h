@@ -8,6 +8,8 @@
 
 /* 裸机模式主循环(内部 while(1), 不返回) */
 void CAR_LineFollow(void);
+/* 获取当前运动状态文本(供 UI 数据页显示), buf 至少 12 字节 */
+void CAR_GetState(char *buf);
 
 #if RTOS_ENABLE
 /* RTOS 主控任务(周期 2ms, 复用与裸机相同的步骤函数) */
