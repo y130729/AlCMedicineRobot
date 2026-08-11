@@ -1,0 +1,10 @@
+﻿# Qt Creator build outputs & user settings
+build/
+build-*/
+*.pro.user
+*.pro.user.*
+*.user
+
+# 系统/编辑器杂项
+Thumbs.db
+.DS_Store
