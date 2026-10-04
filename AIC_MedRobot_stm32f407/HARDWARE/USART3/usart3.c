@@ -3,6 +3,7 @@
 #include "stdarg.h"
 #include "stdio.h"
 #include "string.h"
+#include "exti.h"
 #include "timer.h"
 #include "wifi_transfer.h"
 #include "lcd.h"
@@ -152,21 +153,159 @@ void usart3_set_baudrate(u32 bound)
 
 //串口3,printf 函数
 //确保一次发送数据不超过USART3_MAX_SEND_LEN字节
+/* ==================== Text TX queue (shared USART3) ====================
+ * Before: u3_printf() busy-waited one byte at a time and returned early while
+ * the video DMA was active, so STATUS/ACK reports were silently dropped.
+ * Now: the text is formatted into a bounded buffer, appended to a ring buffer
+ * and handed to DMA in small chunks. Video frames and text share DMA1_Stream3,
+ * therefore a burst is only started when the stream is idle and the pending
+ * text is pumped as soon as the link frees up (control loop + DMA done ISR).
+ * Ring access uses a short critical section so tasks and the ISR can share it.
+ */
+#define USART3_FMT_MAX   192
+
+static u8  usart3_txq[USART3_TXQ_SIZE];
+static volatile u16 usart3_txq_rd = 0;
+static volatile u16 usart3_txq_wr = 0;
+static volatile u16 usart3_txq_cnt = 0;
+static volatile u16 usart3_tx_overflow = 0;
+volatile u8 usart3_tx_owner = 0;/* 0=idle, 1=text queue, 2=video frame */
+
+static u32 usart3_crit_enter(void)
+{
+	u32 pm = __get_PRIMASK();
+	__disable_irq();
+	return pm;
+}
+
+static void usart3_crit_exit(u32 pm)
+{
+	if (pm == 0)
+		__enable_irq();
+}
+
+static void usart3_txq_push(const u8 *buf, u16 len)
+{
+	u16 i;
+	u32 pm = usart3_crit_enter();
+
+	for (i = 0; i < len; i++)
+	{
+		if (usart3_txq_cnt >= USART3_TXQ_SIZE)
+		{
+			usart3_tx_overflow++;/* queue full: count it, keep the link usable */
+			break;
+		}
+		usart3_txq[usart3_txq_wr] = buf[i];
+		usart3_txq_wr = (u16)((usart3_txq_wr + 1) % USART3_TXQ_SIZE);
+		usart3_txq_cnt++;
+	}
+	usart3_crit_exit(pm);
+}
+
+void USART3_TextPump(void)
+{
+	u16 n, i;
+	u32 pm;
+
+	/* take ring -> DMA atomically so tasks and the DMA ISR never interleave */
+	pm = usart3_crit_enter();
+	if (usart3_txq_cnt == 0 || usart3_tx_owner != 0 || USART3_DMA_IsBusy())
+	{
+		usart3_crit_exit(pm);
+		return;
+	}
+	n = usart3_txq_cnt;
+	if (n > USART3_TX_CHUNK)
+		n = USART3_TX_CHUNK;
+	for (i = 0; i < n; i++)
+	{
+		USART3_TX_BUF[i] = usart3_txq[usart3_txq_rd];
+		usart3_txq_rd = (u16)((usart3_txq_rd + 1) % USART3_TXQ_SIZE);
+	}
+	usart3_txq_cnt = (u16)(usart3_txq_cnt - n);
+	USART3_DMA_TryStart(USART3_TX_BUF, (u32)n, 1);/* link was idle above */
+	usart3_crit_exit(pm);
+}
+
+void USART3_TextFlush(void)
+{
+	u32 pm = usart3_crit_enter();
+
+	usart3_txq_rd = 0;
+	usart3_txq_wr = 0;
+	usart3_txq_cnt = 0;
+	usart3_crit_exit(pm);
+}
+
+void USART3_SendRaw(const u8 *buf, u16 len)
+{
+	if (buf == 0 || len == 0)
+		return;
+	usart3_txq_push(buf, len);
+	USART3_TextPump();
+}
+
+/* Send the "+++" escape as an isolated burst: only when the queue is empty
+ * and the stream is idle, so the module sees the required silence around it.
+ * Returns 0 when the link is still busy; the caller retries later. */
+u8 USART3_SendEscape(void)
+{
+	u32 pm;
+	u8 ok = 0;
+
+	pm = usart3_crit_enter();
+	if (usart3_txq_cnt == 0 && usart3_tx_owner == 0 && !USART3_DMA_IsBusy())
+	{
+		USART3_TX_BUF[0] = 0x2B;/* + */
+		USART3_TX_BUF[1] = 0x2B;
+		USART3_TX_BUF[2] = 0x2B;
+		USART3_DMA_TryStart(USART3_TX_BUF, 3, 1);
+		ok = 1;
+	}
+	usart3_crit_exit(pm);
+	return ok;
+}
+
+u16 USART3_TextPending(void)
+{
+	return usart3_txq_cnt;
+}
+
+u16 USART3_TextOverflow(void)
+{
+	return usart3_tx_overflow;
+}
+
+void USART3_WaitIdle(void)
+{
+	u32 t0 = EXTIX_GetMillis();
+
+	while (USART3_DMA_IsBusy())
+	{
+		if ((s32)(EXTIX_GetMillis() - t0) > 200)
+			break;/* bounded wait: never hang the caller */
+	}
+}
+
+/* Bounded, non-blocking printf: format -> ring buffer -> DMA chunk. */
 void u3_printf(char* fmt,...)
 {
-	u16 i,j;
+	char tmp[USART3_FMT_MAX];
 	va_list ap;
-	if (USART3_DMA_IsBusy())/* 图传 DMA 正在发送视频帧: 丢弃本次文本, 避免破坏帧数据(上位机对 ACK 有 500ms 重发兜底) */
+	int n;
+
+	if (fmt == 0)
 		return;
 
-	va_start(ap,fmt);
-	vsprintf((char*)USART3_TX_BUF,fmt,ap);
+	va_start(ap, fmt);
+	n = vsnprintf(tmp, sizeof(tmp), fmt, ap);
 	va_end(ap);
-	i=strlen((const char*)USART3_TX_BUF);//此次发送数据的长度
-	for(j=0;j<i;j++)//循环发送数据
-	{
-	  while(USART_GetFlagStatus(USART3,USART_FLAG_TC)==RESET);  //等待上次发送完成
-		USART_SendData(USART3,(uint8_t)USART3_TX_BUF[j]); 	 //发送数据到串口3
-	}
+	if (n <= 0)
+		return;
+	if (n > (int)(sizeof(tmp) - 1))
+		n = (int)(sizeof(tmp) - 1);/* truncated, still bounded */
 
+	usart3_txq_push((const u8 *)tmp, (u16)n);
+	USART3_TextPump();
 }

@@ -235,7 +235,36 @@ AIC_MedRobot_stm32f407/
 - **USART2 为历史遗留初始化**（蓝牙/旧版 8266 驱动），当前未被使用，可考虑移除。
 - **心跳电量暂为固定值 100**：待接入电池电压采样后替换 `TASK_BATTERY_DEFAULT`。
 - **站点 ID 暂为编译期常量**：后续可存入 24CXX EEPROM 便于现场配置（注意 PB8/PB9 按键复用约束）。
+- **上行文本报文无完整性校验**：目前仅靠 `\r\n` 分帧，未加序号/CRC（图传帧已有 CRC16）；若要抗误码需扩展协议并同步修改 Qt 上位机解析。
 
+
+## 可靠性设计
+
+### 独立看门狗（IWDG）与任务级健康检查
+
+- `WDG_Init()` 在 `main()` 的 WiFi/摄像头初始化之后启动 IWDG（LSI≈32kHz、32 分频、重载 1600 → 超时约 1.6s），避免初始化耗时被误判为死机。
+- RTOS 模式下控制/WiFi/图传/UI 四个任务各自调用 `WDG_TaskTick()` 上报心跳；控制任务每 200ms 调用 `WDG_CheckAndFeed()`，**只有全部任务心跳都落在 1.2s 窗口内才喂狗**，任一任务挂死即复位自恢复；裸机模式由主循环 `WDG_Feed()` 喂狗。
+- `atk_8266_send_cmd()/atk_8266_send_data()` 的等待循环每次轮询补心跳并喂狗：`AT+CWJAP` 等阻塞式 AT 操作可能持续数秒，属有界等待，不应被判为任务挂死。
+
+### WiFi 链路自愈（`wifista.c`）
+
+- `WIFI_LinkOnRxLine()` 逐行检测 `CLOSED` / `WIFI DISCONNECT` / `link is not valid` 等掉线标志，进入恢复流程并上报 `LINK,DOWN`。
+- `WIFI_LinkPoll()` 为完全非阻塞的分级恢复状态机：退出透传（`+++` 逃逸，保证前后静默窗口）→ 重开 TCP（`CIPCLOSE` + `CIPSTART`，重试 8 次）→ 重连 AP（`CWJAP`，重试 5 次）→ 重进透传（`CIPMODE=1` + `CIPSEND`）；各级均失败则指数退避（1s→30s），4 轮后 `AT+RST` 复位模块再来一轮。
+- 恢复期间 `WIFI_IsReconnecting()` 为真，图传任务暂停推流，避免 AT 指令与 JPEG 帧争用 USART3；恢复成功上报 `LINK,UP`。
+- 遥测接口：`WIFI_GetLinkState()`、`WIFI_GetReconnectCount()`。
+
+### USART3 文本发送队列（`usart3.c` / `wifi_transfer.c`）
+
+- 原 `u3_printf()` 用 `vsprintf` 写 400B 固定缓冲（无边界检查）、逐字节 `while(TC==RESET)` 忙等，且图传 DMA 忙时直接丢报文。现改为：`vsnprintf` 有界格式化（192B）→ 768B 环形队列 → 128B 分块 DMA 发送；DMA 一旦空闲即继续排空（控制任务每 2ms 与 DMA 完成中断都会 pump）。
+- `USART3_DMA_TryStart()` 在关中断临界区内完成“判忙 + 启动”，文本队列与图传帧共用 DMA1_Stream3 时不会互相插入；图传启动失败时保留帧数据、下次调用重试，不再丢帧。
+- `USART3_SendEscape()` 仅在队列为空且链路空闲时发出孤立的 `+++`，保证逃逸序列前后静默；`USART3_WaitIdle()` 设 200ms 上限，不会挂死调用者。
+- 队列满时丢弃并累加计数（`USART3_TextOverflow()`），行为可观测，不再无声出错。
+
+### 任务状态机加固（`car_app.c` / `wifi_cmd.c`）
+
+- **进站再武装（`armed`）**：进站触发后必须等三路循迹传感器全部离开黑带（出现白区）才允许下一次触发，避免停车点仍在黑带上时“刚出发就报到达”。
+- **丢线短超时（8s）**：循迹导航中连续全白 8s 即停车并上报 `STATUS,<task>,LINE_LOST`（进入 `TASK_LINE_LOST` 保持停止），非任务遥控循迹同样停车，不再原地搜索直到 5 分钟导航超时。
+- **协议解析加固（`wifi_cmd.c`）**：命令改为整词/前缀严格匹配（`wifi_cmd_is()`、`strncmp("TASK_START,", …)`），修正 `TASK_*` 参数指针偏移少 1 字节导致 `task_id` 为空的缺陷，字段为空即判为非法命令。
 
 ## FreeRTOS 移植设计
 
@@ -537,4 +566,4 @@ __asm void PendSV_Handler(void)
 
 ---
 
-*文档版本: 1.3 | 最后更新: 2026-08-11 | 整合任务配送协议、二维码识别说明与整体功能清单*
+*文档版本: 1.4 | 最后更新: 2026-10-04 | 新增看门狗、WiFi 链路自愈、USART3 文本发送队列与任务状态机加固*

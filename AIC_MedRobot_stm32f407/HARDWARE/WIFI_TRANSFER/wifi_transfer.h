@@ -15,6 +15,7 @@ extern const u16 jpeg_img_size_tbl[][2];
 void USART3_DMA_TX_Init(void);
 void USART3_Send_DMA_Start(uint8_t *buf, uint32_t len);
 u8   USART3_DMA_IsBusy(void);
+u8   USART3_DMA_TryStart(uint8_t *buf, uint32_t len, u8 owner);/* 0 = stream busy */
 void jpeg_frame_callback(void);
 int  jpeg_process_and_send(void);
 

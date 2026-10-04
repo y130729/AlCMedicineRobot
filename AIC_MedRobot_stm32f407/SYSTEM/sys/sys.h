@@ -79,6 +79,18 @@ void WFI_SET(void);		//执行WFI指令
 void INTX_DISABLE(void);//关闭所有中断
 void INTX_ENABLE(void);	//开启所有中断
 void MSR_MSP(u32 addr);	//设置堆栈地址 
+/* ==================== Watchdog / task health (IWDG) ==================== */
+#define WDG_TASK_COUNT      4
+#define WDG_TASK_CONTROL    0
+#define WDG_TASK_WIFI       1
+#define WDG_TASK_JPEG       2
+#define WDG_TASK_UI         3
+
+void WDG_Init(void);            /* start IWDG (~1.6s); call after slow init */
+void WDG_Feed(void);            /* reload the watchdog counter */
+void WDG_TaskTick(u8 id);       /* per-task liveness heartbeat   */
+u8   WDG_CheckAndFeed(void);    /* 1 = all tasks alive, counter reloaded */
+
 #endif
 
 

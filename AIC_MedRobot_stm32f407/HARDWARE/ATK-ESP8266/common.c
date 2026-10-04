@@ -150,6 +150,8 @@ u8 atk_8266_send_cmd(u8 *cmd,u8 *ack,u16 waittime)
 		while(--waittime)	//等待倒计时
 		{
 			delay_ms(10);
+			WDG_TaskTick(WDG_TASK_WIFI);/* bounded AT wait, but can last seconds */
+			WDG_Feed();                 /* (AT+CWJAP): keep the IWDG alive meanwhile */
 			if(USART3_RX_STA&0X8000)//接收到期待的应答结果
 			{
 				if(atk_8266_check_cmd(ack))
@@ -184,6 +186,8 @@ u8 atk_8266_send_data(u8 *data,u8 *ack,u16 waittime)
 		while(--waittime)	//等待倒计时
 		{
 			delay_ms(10);
+			WDG_TaskTick(WDG_TASK_WIFI);/* bounded AT wait, but can last seconds */
+			WDG_Feed();                 /* (AT+CWJAP): keep the IWDG alive meanwhile */
 			if(USART3_RX_STA&0X8000)//接收到期待的应答结果
 			{
 				if(atk_8266_check_cmd(ack))break;//得到有效数据 
@@ -205,17 +209,22 @@ u8 atk_8266_send_data(u8 *data,u8 *ack,u16 waittime)
 //       1,退出失败
 u8 atk_8266_quit_trans(void)
 {
-	while((USART3->SR&0X40)==0);	//等待发送空
-	USART3->DR='+';      
-	delay_ms(15);					//大于串口组帧时间(10ms)
-	while((USART3->SR&0X40)==0);	//等待发送空
-	USART3->DR='+';      
-	delay_ms(15);					//大于串口组帧时间(10ms)
-	while((USART3->SR&0X40)==0);	//等待发送空
-	USART3->DR='+';      
-	delay_ms(1000);					//等待500ms
-	return atk_8266_send_cmd("AT","OK",20);//退出透传判断.
-	
+	u8 i;
+
+	/* Leave transparent mode: flush queued text, wait for a real gap on the
+	 * wire, emit "+++" as an isolated burst, then confirm with an AT probe. */
+	USART3_TextFlush();
+	USART3_WaitIdle();
+	delay_ms(20);
+	for (i = 0; i < 10; i++)
+	{
+		if (USART3_SendEscape())
+			break;
+		delay_ms(10);
+	}
+	USART3_WaitIdle();
+	delay_ms(20);
+	return atk_8266_send_cmd("AT","OK",20);
 }
   
 

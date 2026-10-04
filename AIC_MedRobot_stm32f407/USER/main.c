@@ -4,6 +4,7 @@
 #include "stm32f4xx.h"
 #include <string.h>
 #include "usart.h"
+#include "sys.h"
 #include "delay.h"
 #include "led.h"
 #include "exti.h"
@@ -69,6 +70,9 @@ int main(void)
 	delay_ms(200);
 
 	printf("System ready - WiFi CTRL + LineFollow\r\n");
+
+	/* Start the watchdog only after the slow WiFi/camera init above */
+	WDG_Init();
 
 	/* ºÚÏßÑ­¼£ + WiFiÒ£¿Ø + JPEGÍ¼´« */
 #if RTOS_ENABLE

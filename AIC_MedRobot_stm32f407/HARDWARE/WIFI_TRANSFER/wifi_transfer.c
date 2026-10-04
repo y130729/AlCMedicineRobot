@@ -2,6 +2,7 @@
 #include "stm32f4xx.h"
 #include <string.h>
 #include "dcmi.h"
+#include "usart3.h"
 
 /* ==================== JPEG/WiFi 全局变量 ==================== */
 __align(4) u32 jpeg_buf[JPEG_BUF_SIZE];
@@ -54,6 +55,26 @@ void USART3_Send_DMA_Start(uint8_t *buf, uint32_t len)
 	DMA1_Stream3->CR |= DMA_SxCR_EN;
 }
 
+/* Claim the shared TX stream atomically: 1 = started, 0 = still busy.
+ * Used by both the text queue and the video frame path so a burst can never
+ * be interleaved with another producer. */
+u8 USART3_DMA_TryStart(uint8_t *buf, uint32_t len, u8 owner)
+{
+	u32 pm = __get_PRIMASK();
+	u8 ok = 0;
+
+	__disable_irq();
+	if (dma_tx_busy == 0)
+	{
+		usart3_tx_owner = owner;
+		USART3_Send_DMA_Start(buf, len);
+		ok = 1;
+	}
+	if (pm == 0)
+		__enable_irq();
+	return ok;
+}
+
 u8 USART3_DMA_IsBusy(void)
 {
 	return dma_tx_busy;
@@ -61,11 +82,19 @@ u8 USART3_DMA_IsBusy(void)
 
 void DMA1_Stream3_IRQHandler(void)
 {
+	u8 owner;
+
 	if (DMA1->LISR & DMA_LISR_TCIF3)
 	{
 		DMA1->LIFCR |= DMA_LIFCR_CTCIF3;
 		dma_tx_done = 1;
 		dma_tx_busy = 0;
+
+		/* if the finished transfer was queued text, keep draining it */
+		owner = usart3_tx_owner;
+		usart3_tx_owner = 0;
+		if (owner == 1)
+			USART3_TextPump();
 	}
 }
 
@@ -195,7 +224,10 @@ int jpeg_process_and_send(void)
 	sendPtr[sendLen + 1] = (uint8_t)((crc >> 8) & 0xFF);
 	sendLen += 2;
 
-	USART3_Send_DMA_Start(sendPtr, sendLen);
+	/* Claim the shared TX stream; if text is mid-burst, retry on the next
+	 * call (the frame preparation above is idempotent). */
+	if (!USART3_DMA_TryStart(sendPtr, sendLen, 2))
+		return 0;
 	jpeg_data_ok = 2;
 	return 1;
 }

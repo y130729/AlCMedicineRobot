@@ -1,7 +1,8 @@
 #include "rtos_app.h"
 #include "common.h"        /* atk_8266_at_response_rdCmd */
 #include "wifi_transfer.h" /* JPEG 图传接口 */
-#include "ui.h"            /* UI_Task */
+#include "ui.h"
+#include "wifista.h"            /* UI_Task */
 #include "led.h"
 #include <string.h>
 
@@ -91,6 +92,7 @@ static void vTaskUi(void *pvParameters)
 	for(;;)
 	{
 		vTaskDelayUntil(&xLastWake, PERIOD_UI_MS);
+		WDG_TaskTick(WDG_TASK_UI);
 		RTOS_LcdLock();
 		UI_Task();
 		RTOS_LcdUnlock();
@@ -113,9 +115,14 @@ static void vTaskWifi(void *pvParameters)
 	{
 		vTaskDelayUntil(&xLastWake, PERIOD_WIFI_MS);//每10ms轮询一次WiFi命令
 
+		WDG_TaskTick(WDG_TASK_WIFI);
+		WIFI_LinkPoll();/* step link recovery if needed */
+
 		pCmd = atk_8266_at_response_rdCmd(1);
 		if(pCmd == 0)
 			continue;
+
+		WIFI_LinkOnRxLine(pCmd);/* detect CLOSED / link-loss markers */
 
 		len = strlen(pCmd);
 		if(len == 0)
@@ -143,6 +150,10 @@ static void vTaskJpeg(void *pvParameters)
 	for(;;)
 	{
 		vTaskDelayUntil(&xLastWake, PERIOD_JPEG_MS);
+		WDG_TaskTick(WDG_TASK_JPEG);
+
+		if(WIFI_IsReconnecting())
+			continue;/* pause video during link recovery (AT shares USART3) */
 
 		if(jpeg_data_ok == 1)
 			jpeg_process_and_send();

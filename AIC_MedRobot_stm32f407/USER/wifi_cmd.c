@@ -10,79 +10,78 @@
 /* 遥控命令: 手动控制(forward/backward/left/right/stop/speed) 与任务控制
  * (startTask/stopTask)。startTask 使能循迹, stopTask 停止循迹并刹停。
  * 返回 1 表示命令被识别执行, 返回 0 表示未识别。 */
+/* Exact token match: lines are already split on CR/LF, so a command must
+ * match the whole token (no substring hits such as "forWardX"). */
+static u8 wifi_cmd_is(const char *line, const char *cmd)
+{
+	u32 n = (u32)strlen(cmd);
+
+	if (strncmp(line, cmd, n) != 0)
+		return 0;
+	if (line[n] != 0 && line[n] != ',')
+		return 0;/* require a token or field boundary after the name */
+	return 1;
+}
+
 u8 handle_wifi_command(char *pMsgBuff, u16 *pwmval, u8 *line_enabled)
 {
 	if (pMsgBuff == 0) return 0;
 
-	if (strstr((const char*)pMsgBuff, (const char*)"forWard"))
-		{ MOTOR_Forward(*pwmval);  return 1; }
-	if (strstr((const char*)pMsgBuff, (const char*)"backWard"))
-		{ MOTOR_Backward(*pwmval); return 1; }
-	if (strstr((const char*)pMsgBuff, (const char*)"lefTurn"))
-		{ MOTOR_TurnLeft(*pwmval); return 1; }
-	if (strstr((const char*)pMsgBuff, (const char*)"righTurn"))
-		{ MOTOR_TurnRight(*pwmval); return 1; }
-	if (strstr((const char*)pMsgBuff, (const char*)"letStop"))
-		{ MOTOR_Stop(); return 1; }
-	if (strstr((const char*)pMsgBuff, (const char*)"speedUp"))
+	/* ---- remote control: manual drive / speed / line enable ---- */
+	if (wifi_cmd_is(pMsgBuff, "forWard"))  { MOTOR_Forward(*pwmval);  return 1; }
+	if (wifi_cmd_is(pMsgBuff, "backWard")) { MOTOR_Backward(*pwmval); return 1; }
+	if (wifi_cmd_is(pMsgBuff, "lefTurn"))  { MOTOR_TurnLeft(*pwmval); return 1; }
+	if (wifi_cmd_is(pMsgBuff, "righTurn")) { MOTOR_TurnRight(*pwmval);return 1; }
+	if (wifi_cmd_is(pMsgBuff, "letStop"))  { MOTOR_Stop(); return 1; }
+	if (wifi_cmd_is(pMsgBuff, "speedUp"))
 	{
 		*pwmval += 50;
 		if (*pwmval > 500) *pwmval = 500;
 		return 1;
 	}
-	if (strstr((const char*)pMsgBuff, (const char*)"speedDown"))
+	if (wifi_cmd_is(pMsgBuff, "speedDown"))
 	{
 		if (*pwmval >= 100) *pwmval -= 50;
 		else *pwmval = 50;
 		return 1;
 	}
-	if (strstr((const char*)pMsgBuff, (const char*)"startTask"))
+	if (wifi_cmd_is(pMsgBuff, "startTask")) { *line_enabled = 1; return 1; }
+	if (wifi_cmd_is(pMsgBuff, "stopTask"))  { *line_enabled = 0; MOTOR_Stop(); return 1; }
+
+	/* ---- P0 task commands: strict prefix including the comma, the argument
+	 *      pointer starts right after it (fixes the previous off-by-one that
+	 *      left task_id empty) ---- */
+	if (strncmp(pMsgBuff, "TASK_START,", 11) == 0)
 	{
-		*line_enabled = 1;
+		CAR_OnTaskCommand(CAR_CMD_TASK_START, pMsgBuff + 11, line_enabled);
 		return 1;
 	}
-	if (strstr((const char*)pMsgBuff, (const char*)"stopTask"))
+	if (strncmp(pMsgBuff, "TASK_CONFIRM,", 13) == 0)
 	{
-		*line_enabled = 0;
-		MOTOR_Stop();
+		CAR_OnTaskCommand(CAR_CMD_TASK_CONFIRM, pMsgBuff + 13, line_enabled);
 		return 1;
 	}
-	/* ---- 任务配送命令(P0 闭环协议, 见 P0_task_delivery_design.md) ----
-	 * TASK_START,<task_id>,<from>,<to> / STOP,<task_id>,<station_id> /
-	 * TASK_CONFIRM,<task_id>,<load|unload>,<user> /
-	 * TASK_PAUSE,<task_id> / TASK_RESUME,<task_id> / TASK_CANCEL,<task_id>
-	 * 统一交给 CAR_OnTaskCommand 处理(状态机在 car_app.c), 命令本身不触发遥控覆盖。 */
-	if (strstr((const char*)pMsgBuff, (const char*)"TASK_START"))
+	if (strncmp(pMsgBuff, "TASK_PAUSE,", 11) == 0)
 	{
-		CAR_OnTaskCommand(CAR_CMD_TASK_START, pMsgBuff + 10, line_enabled);
+		CAR_OnTaskCommand(CAR_CMD_TASK_PAUSE, pMsgBuff + 11, line_enabled);
 		return 1;
 	}
-	if (strstr((const char*)pMsgBuff, (const char*)"TASK_CONFIRM"))
+	if (strncmp(pMsgBuff, "TASK_RESUME,", 12) == 0)
 	{
-		CAR_OnTaskCommand(CAR_CMD_TASK_CONFIRM, pMsgBuff + 12, line_enabled);
+		CAR_OnTaskCommand(CAR_CMD_TASK_RESUME, pMsgBuff + 12, line_enabled);
 		return 1;
 	}
-	if (strstr((const char*)pMsgBuff, (const char*)"TASK_PAUSE"))
+	if (strncmp(pMsgBuff, "TASK_CANCEL,", 12) == 0)
 	{
-		CAR_OnTaskCommand(CAR_CMD_TASK_PAUSE, pMsgBuff + 10, line_enabled);
+		CAR_OnTaskCommand(CAR_CMD_TASK_CANCEL, pMsgBuff + 12, line_enabled);
 		return 1;
 	}
-	if (strstr((const char*)pMsgBuff, (const char*)"TASK_RESUME"))
-	{
-		CAR_OnTaskCommand(CAR_CMD_TASK_RESUME, pMsgBuff + 11, line_enabled);
-		return 1;
-	}
-	if (strstr((const char*)pMsgBuff, (const char*)"TASK_CANCEL"))
-	{
-		CAR_OnTaskCommand(CAR_CMD_TASK_CANCEL, pMsgBuff + 11, line_enabled);
-		return 1;
-	}
-	if (strstr((const char*)pMsgBuff, (const char*)"STOP,"))
+	if (strncmp(pMsgBuff, "STOP,", 5) == 0)
 	{
 		CAR_OnTaskCommand(CAR_CMD_STOP, pMsgBuff + 5, line_enabled);
 		return 1;
 	}
-	return 0;
+	return 0;/* not a known command */
 }
 
 /* ---- 命令串拆分执行 ----
