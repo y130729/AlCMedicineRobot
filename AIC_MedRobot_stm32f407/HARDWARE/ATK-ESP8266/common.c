@@ -47,7 +47,7 @@ void atk_8266_at_response(u8 mode)
 	{ 
 		USART3_RX_BUF[USART3_RX_STA&0X7FFF]=0;//添加结束符
 		printf("%s",USART3_RX_BUF);	//发送到串口
-		if(mode)USART3_RX_STA=0;
+		if(mode)USART3_RxReset();
 	}  
 
 	
@@ -65,7 +65,7 @@ char* atk_8266_at_response_rdCmd(u8 mode)
 	{ 
 		USART3_RX_BUF[USART3_RX_STA&0X7FFF]=0;	//添加结束符
 		strx = (char*)USART3_RX_BUF;		
-		if(mode)USART3_RX_STA=0;
+		if(mode)USART3_RxReset();
 	}  
 	return strx;
 }
@@ -87,7 +87,7 @@ char* atk_8266_at_response_test(u8 mode)
 		
 	//	LCD_ShowString(40,26,200,300,16,USART3_RX_BUF);
 		
-		if(mode)USART3_RX_STA=0;
+		if(mode)USART3_RxReset();
 	}  
 	
 	return strx;
@@ -143,15 +143,16 @@ u8* atk_8266_check_cmd(u8 *str)
 u8 atk_8266_send_cmd(u8 *cmd,u8 *ack,u16 waittime)
 {
 	u8 res=0; 
-	USART3_RX_STA=0;
+	USART3_RxReset();
 	u3_printf("%s\r\n",cmd);	//发送命令
 	if(ack&&waittime)		//需要等待应答
 	{
 		while(--waittime)	//等待倒计时
 		{
 			delay_ms(10);
-			WDG_TaskTick(WDG_TASK_WIFI);/* bounded AT wait, but can last seconds */
-			WDG_Feed();                 /* (AT+CWJAP): keep the IWDG alive meanwhile */
+			/* bounded AT wait: report progress for THIS task only.
+			 * Feeding the IWDG here would hide a dead control/UI task. */
+			WDG_TaskProgress(WDG_TASK_WIFI);
 			if(USART3_RX_STA&0X8000)//接收到期待的应答结果
 			{
 				if(atk_8266_check_cmd(ack))
@@ -159,7 +160,7 @@ u8 atk_8266_send_cmd(u8 *cmd,u8 *ack,u16 waittime)
 					printf("ack:%s\r\n",(u8*)ack);
 					break;//得到有效数据 
 				}
-					USART3_RX_STA=0;
+					USART3_RxReset();
 			} 
 		}
 		if(waittime==0)res=1; 
@@ -179,19 +180,20 @@ u8 atk_8266_send_cmd(u8 *cmd,u8 *ack,u16 waittime)
 u8 atk_8266_send_data(u8 *data,u8 *ack,u16 waittime)
 {
 	u8 res=0; 
-	USART3_RX_STA=0;
+	USART3_RxReset();
 	u3_printf("%s",data);	//发送命令
 	if(ack&&waittime)		//需要等待应答
 	{
 		while(--waittime)	//等待倒计时
 		{
 			delay_ms(10);
-			WDG_TaskTick(WDG_TASK_WIFI);/* bounded AT wait, but can last seconds */
-			WDG_Feed();                 /* (AT+CWJAP): keep the IWDG alive meanwhile */
+			/* bounded AT wait: report progress for THIS task only.
+			 * Feeding the IWDG here would hide a dead control/UI task. */
+			WDG_TaskProgress(WDG_TASK_WIFI);
 			if(USART3_RX_STA&0X8000)//接收到期待的应答结果
 			{
 				if(atk_8266_check_cmd(ack))break;//得到有效数据 
-				USART3_RX_STA=0;
+				USART3_RxReset();
 			} 
 		}
 		if(waittime==0)res=1; 

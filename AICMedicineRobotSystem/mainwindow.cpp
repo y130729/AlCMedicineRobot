@@ -50,7 +50,8 @@ QString MainWindow::stationName(const QString &id) const
 bool MainWindow::isProtocolTextLine(const QByteArray &line) const
 {
     static const char *prefixes[] = {
-        "ACK,", "ENTER_STATION,", "STATUS,", "TASK_ARRIVE,", "TASK_DONE,", "HEARTBEAT,"
+        "ACK,", "ENTER_STATION,", "STATUS,", "TASK_ARRIVE,", "TASK_DONE,",
+        "HEARTBEAT,", "LINK,", "STATS,", "BOOT_TIMEOUT,"
     };
     for (unsigned i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); ++i) {
         if (line.startsWith(prefixes[i]))
@@ -64,7 +65,8 @@ void MainWindow::handleProtocolLine(const QByteArray &line)
     QString s = QString::fromUtf8(line);
     QStringList p = s.split(',');
     if (s.startsWith("ACK,")) {
-        if (p.size() >= 3) handleAck(p.at(1), p.at(2) == "1");
+        if (p.size() >= 3)
+            handleAck(p.at(1), p.at(2) == "1", p.size() >= 4 ? p.at(3) : QString());
     } else if (s.startsWith("ENTER_STATION,")) {
         if (p.size() >= 3) handleEnterStation(p.at(1), p.at(2).toInt());
     } else if (s.startsWith("STATUS,")) {
@@ -76,6 +78,10 @@ void MainWindow::handleProtocolLine(const QByteArray &line)
         if (p.size() >= 2) handleDone(p.at(1));
     } else if (s.startsWith("HEARTBEAT,")) {
         if (p.size() >= 3) handleHeartbeat(p.at(1).toInt(), p.at(2));
+    } else if (s.startsWith("LINK,")) {
+        addLog(QString("链路状态: %1").arg(p.size() >= 2 ? p.at(1) : QString()));
+    } else if (s.startsWith("STATS,")) {
+        addLog(QString("控制环统计: %1").arg(s.mid(6)));
     }
 }
 
@@ -123,8 +129,11 @@ QString MainWindow::currentTaskId() const
 // 通用下行命令发送: 记录待确认命令, 500ms 未回 ACK 重发(最多 3 次)
 void MainWindow::sendCommandWithAck(const QString &cmd, const QString &taskId)
 {
-    sendCarCommand(cmd);
-    m_pendingCmd = cmd;
+    // Append a monotonic seq so the MCU can recognise retransmissions of the
+    // same command and replay the previous ACK instead of rejecting it after
+    // the state machine has already advanced (idempotent TASK_*/STOP).
+    m_pendingCmd = cmd + QString(",seq=%1").arg(++m_cmdSeq);
+    sendCarCommand(m_pendingCmd);
     m_pendingTaskId = taskId;
     m_ackRetryCount = 0;
     m_ackTimer->start(500);
@@ -175,7 +184,7 @@ void MainWindow::sendTaskConfirm(const QString &taskId, const QString &action, c
     sendCommandWithAck(QString("TASK_CONFIRM,%1,%2,%3").arg(taskId).arg(action).arg(user), taskId);
 }
 
-void MainWindow::handleAck(const QString &taskId, bool ok)
+void MainWindow::handleAck(const QString &taskId, bool ok, const QString &reason)
 {
     bool resolvedPending = (taskId == m_pendingTaskId);
     bool wasStart = m_pendingCmd.startsWith("TASK_START");
@@ -205,7 +214,8 @@ void MainWindow::handleAck(const QString &taskId, bool ok)
             t->state = "下发失败";
             updateTaskItem(t);
         }
-        addLog(QString("任务 %1 命令被小车拒绝(ACK=0)").arg(taskId));
+        addLog(QString("任务 %1 命令被小车拒绝(ACK=0, %2)")
+               .arg(taskId).arg(reason.isEmpty() ? "STATE" : reason));
     }
 }
 
@@ -467,6 +477,7 @@ MainWindow::MainWindow(QWidget *parent)
     m_wifiOnline = false;
     m_lastHeartbeatMs = 0;
     m_ackRetryCount = 0;
+    m_cmdSeq = 1;
 
     // 启动视频监听
     onVideoListenClicked();
@@ -542,110 +553,26 @@ void MainWindow::videoNewClientConnect()
 void MainWindow::readVideoMessage()
 {
     static const QByteArray FRAME_HEADER = QByteArray::fromHex("AA55");
+    static const QByteArray CHUNK_HEADER = QByteArray::fromHex("AA55A55A");
 
     QByteArray data = m_videoSocket->readAll();
-    qDebug() << "Video data received, size:" << data.size();
     m_recvBuffer.append(data);
 
-    // 文本行优先解析: 完整 \r\n 结尾且命中协议前缀的按文本处理。
-    // 视频帧二进制中也可能出现 \r\n, 因此仅前缀命中的行才剥离, 其余留给帧解析。
-    while (true) {
-        int nl = m_recvBuffer.indexOf("\r\n");
-        if (nl == -1)
-            break;
-        QByteArray line = m_recvBuffer.left(nl);
-        if (isProtocolTextLine(line)) {
-            m_recvBuffer.remove(0, nl + 2);
-            handleProtocolLine(line);
-            continue;
-        }
-        break;
-    }
-
-    // 防止缓冲区无限增长 (最大 64KB)
-    const int MAX_BUFFER = 64 * 1024;
-    if (m_recvBuffer.size() > MAX_BUFFER)
-    {
-        qDebug() << "Buffer overflow, discarding oldest data";
-        m_recvBuffer.remove(0, m_recvBuffer.size() - MAX_BUFFER / 2);
-    }
-
-    while (true)
-    {
-        if (m_recvBuffer.size() < 6)
-            break;
-
-        // 查找帧头 0xAA55
-        int headIndex = m_recvBuffer.indexOf(FRAME_HEADER);
-        if (headIndex == -1)
-        {
-            // 保留最后 1 字节: 0xAA 可能正好在包边界处被切断,等下一个包
-            if (m_recvBuffer.size() > 1)
-                m_recvBuffer.remove(0, m_recvBuffer.size() - 1);
-            break;
-        }
-
-        // 丢弃帧头之前的无效数据
-        if (headIndex > 0)
-        {
-            m_recvBuffer.remove(0, headIndex);
-        }
-
-        if (m_recvBuffer.size() < 6)
-            break;
-
-        // 读取 JPEG 长度（4 bytes little-endian）
-        uint32_t jpegLen = (uint8_t)m_recvBuffer.at(2) |
-            ((uint8_t)m_recvBuffer.at(3) << 8) |
-            ((uint8_t)m_recvBuffer.at(4) << 16) |
-            ((uint8_t)m_recvBuffer.at(5) << 24);
-
-        // 长度合法性校验 (JPEG 应在 500B ~ 50KB 之间)
-        if (jpegLen < 500 || jpegLen > 50 * 1024)
-        {
-            // 可能是假阳性帧头(JPEG数据中恰巧出现0xAA55), 跳过1字节重试
-            qDebug() << "Invalid jpegLen:" << jpegLen << ", skipping 1 byte";
-            m_recvBuffer.remove(0, 1);
-            continue;
-        }
-
-        uint32_t fullLen = 2 + 4 + jpegLen + 2;
-        if ((uint32_t)m_recvBuffer.size() < fullLen)
-            break;
-
-        QByteArray jpegData = m_recvBuffer.mid(6, jpegLen);
-        QByteArray crcData = m_recvBuffer.mid(6 + jpegLen, 2);
-
-        uint16_t calcCrc = crc16_ccitt((const uint8_t*)jpegData.constData(), jpegData.size());
-        uint16_t recvCrc = (uint8_t)crcData.at(0) | ((uint8_t)crcData.at(1) << 8);
-
-        if (calcCrc != recvCrc)
-        {
-            qDebug() << "CRC mismatch! skipping 1 byte";
-            m_recvBuffer.remove(0, 1);  // 假阳性帧头,回退1字节重新扫描
-            continue;
-        }
-
+    auto showJpeg = [this](const QByteArray &jpegData) {
         QPixmap pixmap;
-        if (!pixmap.loadFromData(jpegData))
-        {
+        if (!pixmap.loadFromData(jpegData)) {
             qDebug() << "Failed to load pixmap from jpeg data";
-            m_recvBuffer.remove(0, fullLen);
-            continue;
+            return;
         }
-
-        qDebug() << "Frame decoded OK, JPEG size:" << jpegLen
+        qDebug() << "Frame decoded OK, JPEG size:" << jpegData.size()
                  << "pixmap:" << pixmap.width() << "x" << pixmap.height();
         m_pixmap = pixmap;
-        if (cameraLabel) {
+        if (cameraLabel)
             cameraLabel->setPixmap(pixmap);
-        }
 
-        // 识别窗口内对每帧尝试解码站点二维码
         if (m_recogActive) {
             QString qr = tryDecodeQR(pixmap.toImage());
             if (!qr.isEmpty()) {
-                // 设计 5.2: 二维码内容 = 站点ID + 1 字节校验位, 故按前缀匹配
                 bool hit = (qr == m_recogTargetStation) ||
                            (qr.startsWith(m_recogTargetStation) &&
                             qr.size() <= m_recogTargetStation.size() + 1);
@@ -658,13 +585,164 @@ void MainWindow::readVideoMessage()
                 }
             }
         }
+    };
 
-        m_recvBuffer.remove(0, fullLen);
+    bool progress = true;
+    while (progress)
+    {
+        progress = false;
+        if (m_recvBuffer.isEmpty())
+            break;
+
+        // 1) A protocol text line may sit between two video chunks.
+        int nl = m_recvBuffer.indexOf("\r\n");
+        if (nl >= 0) {
+            QByteArray line = m_recvBuffer.left(nl);
+            if (isProtocolTextLine(line)) {
+                m_recvBuffer.remove(0, nl + 2);
+                handleProtocolLine(line);
+                progress = true;
+                continue;
+            }
+        }
+
+        // 2) Chunked video packet: AA 55 A5 5A | total | offset | len | data | CRC
+        if (m_recvBuffer.startsWith(CHUNK_HEADER))
+        {
+            if (m_recvBuffer.size() < 10)
+                break;
+            uint32_t total = (uint8_t)m_recvBuffer.at(4) |
+                             ((uint8_t)m_recvBuffer.at(5) << 8);
+            uint32_t offset = (uint8_t)m_recvBuffer.at(6) |
+                              ((uint8_t)m_recvBuffer.at(7) << 8);
+            uint32_t chunkLen = (uint8_t)m_recvBuffer.at(8) |
+                                ((uint8_t)m_recvBuffer.at(9) << 8);
+
+            if (total < 500 || total > 50 * 1024 || chunkLen == 0 ||
+                chunkLen > 256 || offset + chunkLen > total) {
+                qDebug() << "Invalid video chunk header, resync";
+                m_recvBuffer.remove(0, 1);
+                progress = true;
+                continue;
+            }
+            uint32_t fullLen = 10 + chunkLen + 2;
+            if ((uint32_t)m_recvBuffer.size() < fullLen)
+                break;
+
+            QByteArray payload = m_recvBuffer.mid(10, chunkLen);
+            uint16_t recvCrc = (uint8_t)m_recvBuffer.at(10 + chunkLen) |
+                               ((uint8_t)m_recvBuffer.at(10 + chunkLen + 1) << 8);
+            uint16_t calcCrc = crc16_ccitt((const uint8_t*)payload.constData(), payload.size());
+            if (calcCrc != recvCrc) {
+                qDebug() << "Video chunk CRC mismatch, resync";
+                m_recvBuffer.remove(0, 1);
+                progress = true;
+                continue;
+            }
+
+            if (offset == 0) {
+                m_jpegAssembly.clear();
+                m_jpegExpected = (int)total;
+            }
+            if ((int)total != m_jpegExpected ||
+                (int)offset != m_jpegAssembly.size()) {
+                // Lost a chunk: drop the partial frame and wait for offset 0.
+                m_jpegAssembly.clear();
+                m_jpegExpected = (int)total;
+                if (offset != 0) {
+                    m_recvBuffer.remove(0, fullLen);
+                    progress = true;
+                    continue;
+                }
+            }
+            m_jpegAssembly.append(payload);
+            m_recvBuffer.remove(0, fullLen);
+            progress = true;
+
+            if (m_jpegAssembly.size() == m_jpegExpected) {
+                QByteArray jpeg = m_jpegAssembly;
+                m_jpegAssembly.clear();
+                m_jpegExpected = 0;
+                showJpeg(jpeg);
+            }
+            continue;
+        }
+
+        // 3) Legacy complete frame: AA 55 | len32 | JPEG | CRC16
+        if (m_recvBuffer.startsWith(FRAME_HEADER))
+        {
+            if (m_recvBuffer.size() < 6)
+                break;
+            uint32_t jpegLen = (uint8_t)m_recvBuffer.at(2) |
+                ((uint8_t)m_recvBuffer.at(3) << 8) |
+                ((uint8_t)m_recvBuffer.at(4) << 16) |
+                ((uint8_t)m_recvBuffer.at(5) << 24);
+            if (jpegLen < 500 || jpegLen > 50 * 1024) {
+                m_recvBuffer.remove(0, 1);
+                progress = true;
+                continue;
+            }
+            uint32_t fullLen = 6 + jpegLen + 2;
+            if ((uint32_t)m_recvBuffer.size() < fullLen)
+                break;
+            QByteArray jpegData = m_recvBuffer.mid(6, jpegLen);
+            uint16_t recvCrc = (uint8_t)m_recvBuffer.at(6 + jpegLen) |
+                               ((uint8_t)m_recvBuffer.at(6 + jpegLen + 1) << 8);
+            uint16_t calcCrc = crc16_ccitt((const uint8_t*)jpegData.constData(), jpegData.size());
+            if (calcCrc != recvCrc) {
+                m_recvBuffer.remove(0, 1);
+                progress = true;
+                continue;
+            }
+            m_recvBuffer.remove(0, fullLen);
+            showJpeg(jpegData);
+            progress = true;
+            continue;
+        }
+
+        // 4) A protocol line may be split across TCP reads: do not discard
+        //    it just because its CRLF has not arrived yet.
+        static const char *waiting[] = {
+            "ACK,", "ENTER_STATION,", "STATUS,", "TASK_ARRIVE,", "TASK_DONE,",
+            "HEARTBEAT,", "LINK,", "STATS,", "BOOT_TIMEOUT,"
+        };
+        bool incompleteLine = false;
+        for (unsigned i = 0; i < sizeof(waiting) / sizeof(waiting[0]); ++i) {
+            if (m_recvBuffer.startsWith(waiting[i])) {
+                incompleteLine = true;
+                break;
+            }
+        }
+        if (incompleteLine)
+            break;
+
+        // 5) Resync to the next frame/chunk magic.
+        int headIndex = m_recvBuffer.indexOf(FRAME_HEADER);
+        if (headIndex < 0) {
+            if (m_recvBuffer.size() > 1)
+                m_recvBuffer.remove(0, m_recvBuffer.size() - 1);
+            break;
+        }
+        if (headIndex > 0) {
+            m_recvBuffer.remove(0, headIndex);
+            progress = true;
+            continue;
+        }
+        break;
+    }
+
+    // Bound the buffer if a sender never produces a valid header.
+    const int MAX_BUFFER = 64 * 1024;
+    if (m_recvBuffer.size() > MAX_BUFFER) {
+        qDebug() << "Buffer overflow, discarding oldest data";
+        m_recvBuffer.remove(0, m_recvBuffer.size() - MAX_BUFFER / 2);
     }
 }
 
 void MainWindow::videoDisConnect()
 {
+    m_jpegAssembly.clear();
+    m_jpegExpected = 0;
     qDebug() << "Video server: client disconnected";
     addLog("小车视频连接断开");
     m_wifiOnline = false;

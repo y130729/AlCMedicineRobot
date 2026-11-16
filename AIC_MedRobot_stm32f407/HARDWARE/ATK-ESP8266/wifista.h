@@ -1,7 +1,10 @@
 #ifndef __WIFISTA_H__
 #define __WIFISTA_H__
 
-void atk_8266_wifista_config(void);
+#include "sys.h"
+
+/* Bounded boot: 0 = TCP link up, 1 = timeout/offline (never hangs). */
+u8   atk_8266_wifista_config(void);
 
 /* Network info accessors (read-only, for UI display etc.) */
 const char* ATK_8266_GetSSID(void);       /* target AP SSID          */
@@ -15,6 +18,7 @@ u8 ATK_8266_IsOnline(void);               /* AP connected & got IP   */
 #define WIFI_LINK_UP     1
 
 void WIFI_LinkInit(void);                 /* start supervision (link is UP)   */
+void WIFI_LinkStartRecovery(void);        /* boot timeout -> recover in background */
 void WIFI_LinkPoll(void);                 /* step the recovery FSM (~10ms)    */
 void WIFI_LinkOnRxLine(const char *line); /* feed received lines (loss detect)*/
 u8   WIFI_IsReconnecting(void);           /* 1 = pause video / AT in progress */

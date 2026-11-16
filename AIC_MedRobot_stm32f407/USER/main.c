@@ -1,5 +1,4 @@
-//STM32F4工程-库函数版本
-//整合 WiFi遥控 + JPEG图传 + 循迹小车
+//STM32F4 medicine delivery car: WiFi link + JPEG stream + line following
 
 #include "stm32f4xx.h"
 #include <string.h>
@@ -27,61 +26,75 @@
 #include "car_app.h"
 
 
-/* ==================== 主函数 ==================== */
+/* ==================== Boot ====================
+ * Order matters: DWT and the IWDG are started first so that a hang in any
+ * later initialisation is caught. The WiFi bring-up is bounded (see
+ * atk_8266_wifista_config): a missing AP or server no longer keeps the car
+ * out of the main loop forever. On timeout the car keeps running offline and
+ * the link recovery state machine retries in the background.
+ */
 int main(void)
 {
-	uart_init(115200);/*串口1初始化，用于调试信息的打印*/
-	delay_init(168);
-	LED_Init();
-	LCD_Init();
-	Adc_Init();/*ADC初始化，用于读取循迹传感器数据*/
+	u8 wifi_ok;
 
-	/* WiFi相关初始化 */
-	usart2_init(9600);/*预留串口2初始化，暂时弃用*/
-	usart3_init(115200);/*串口3初始化，用于WiFi模块通信*/
-	USART3_DMA_TX_Init();/*串口3 DMA发送初始化，用于WiFi发送视频帧数据*/
+	uart_init(115200);
+	delay_init(168);
+	DWT_Init();          /* cycle counter: jitter stats + echo timestamps */
+	WDG_Init();
+	LED_Init();
+
+	LCD_Init();
+	WDG_Feed();
+	Adc_Init();          /* TIM2 -> ADC3 scan -> DMA (non blocking) */
+
+	usart2_init(9600);
+	usart3_init(115200);
+	USART3_DMA_TX_Init();
 
 #if TOUCH_MODULE_ENABLE
 	tp_dev.init();
 #endif
 	UI_Init();
+	WDG_Feed();
 
 	MOTOR_Init();
-	EXTIX_Init();/*外部中断初始化*/
-	HC_SR04_Init();
-	TIM3_Int_Init(1000 - 1, 84 - 1);
+	EXTIX_Init();
+	HC_SR04_Init();      /* EXTI3 echo capture, no blocking measurement */
+	WDG_Feed();
 
-	/* 摄像头初始化(默认RGB565模式) */
 	CAMERA_Init();
+	WDG_Feed();
 
-	/* WiFi连接 */
 	LCD_ShowString(30, 100, 210, 24, 16, "WiFi connecting...");
-	atk_8266_wifista_config();
-	LCD_ShowString(30, 100, 210, 24, 16, "WiFi online       ");
+	wifi_ok = atk_8266_wifista_config();
+	WDG_Feed();
+	if (wifi_ok == 0)
+	{
+		LCD_ShowString(30, 100, 210, 24, 16, "WiFi online       ");
+	}
+	else
+	{
+		/* boot timeout: offline / manual mode, retry from the WiFi task */
+		LCD_ShowString(30, 100, 210, 24, 16, "WiFi OFFLINE      ");
+		printf("BOOT_TIMEOUT\r\n");
+		WIFI_LinkStartRecovery();
+	}
 
-	/* 切换为JPEG模式以支持WiFi图传 */
 	OV2640_JPEG_Mode();
 	dcmi_rx_callback = jpeg_frame_callback;
-	DCMI_DMA_Init((u32)jpeg_buf, JPEG_BUF_SIZE, DMA_MemoryDataSize_Word, DMA_MemoryInc_Enable);/* JPEG图像数据接收缓冲区初始化 */
+	DCMI_DMA_Init((u32)jpeg_buf, JPEG_BUF_SIZE, DMA_MemoryDataSize_Word, DMA_MemoryInc_Enable);
 	OV2640_OutSize_Set(jpeg_img_size_tbl[3][1], jpeg_img_size_tbl[3][0]);  // QVGA 320x240
 	CAMERA_SetJpegMode(1);
 	DCMI_Start();
 
 	delay_ms(200);
+	WDG_Feed();
 
 	printf("System ready - WiFi CTRL + LineFollow\r\n");
 
-	/* Start the watchdog only after the slow WiFi/camera init above */
-	WDG_Init();
-
-	/* 黑线循迹 + WiFi遥控 + JPEG图传 */
 #if RTOS_ENABLE
-	/* RTOS模式: 创建任务并启动调度器(不返回) */
 	RTOS_Start();
 #else
-	/* 裸机模式: 保持原有大循环 */
 	CAR_LineFollow();
 #endif
 }
-
-

@@ -47,6 +47,7 @@ u8 handle_wifi_command(char *pMsgBuff, u16 *pwmval, u8 *line_enabled)
 	}
 	if (wifi_cmd_is(pMsgBuff, "startTask")) { *line_enabled = 1; return 1; }
 	if (wifi_cmd_is(pMsgBuff, "stopTask"))  { *line_enabled = 0; MOTOR_Stop(); return 1; }
+	if (wifi_cmd_is(pMsgBuff, "STATS"))     { CAR_PrintStats(); return 1; }
 
 	/* ---- P0 task commands: strict prefix including the comma, the argument
 	 *      pointer starts right after it (fixes the previous off-by-one that

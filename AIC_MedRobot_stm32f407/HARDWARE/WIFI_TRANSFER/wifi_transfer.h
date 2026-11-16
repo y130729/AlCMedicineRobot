@@ -18,5 +18,7 @@ u8   USART3_DMA_IsBusy(void);
 u8   USART3_DMA_TryStart(uint8_t *buf, uint32_t len, u8 owner);/* 0 = stream busy */
 void jpeg_frame_callback(void);
 int  jpeg_process_and_send(void);
+void JPEG_TxAbort(void);            /* drop a partially sent frame         */
+u32  JPEG_TxDropped(void);          /* frames deferred/aborted since boot  */
 
 #endif

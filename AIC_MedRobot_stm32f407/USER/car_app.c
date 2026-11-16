@@ -22,7 +22,7 @@
 #include "wifista.h"
 
 /* ==================== 循迹/避障参数 ==================== */
-#define RANGE_SAMPLE_PERIOD_MS  100
+#define RANGE_SAMPLE_PERIOD_MS   50
 #define ADC_SAMPLE_PERIOD_MS    250
 #define OBSTACLE_DISTANCE_CM   25.0f
 #define OBSTACLE_CLEAR_CM      28.0f
@@ -36,6 +36,12 @@
 
 /* line lost: stop the car and report instead of searching for 5 minutes */
 #define LINE_LOST_TIMEOUT_MS     8000
+
+/* non-blocking steering (differential drive, no delay_ms pulses) */
+#define LINE_STEER_DEADBAND       300
+#define LINE_STEER_FULL_SCALE    3000
+#define LINE_SEARCH_PIVOT_MS      200
+#define LINE_SEARCH_SETTLE_MS     150
 
 
 /* ==================== ADC/LED 杈呭姪 ==================== */
@@ -63,9 +69,8 @@ typedef enum
 static u8 g_car_state = CAR_STATE_STOP;
 static void ADC_ReadLineSensors(void)
 {
-	adcL = Get_Adc_Average(ADC_Channel_5, LINE_SAMPLE_TIMES);
-	adcM = Get_Adc_Average(ADC_Channel_4, LINE_SAMPLE_TIMES);
-	adcR = Get_Adc_Average(ADC_Channel_15, LINE_SAMPLE_TIMES);
+	/* TIM2-triggered ADC3 scan + DMA: never blocks (was 30 ms of delays) */
+	Adc_ReadLine(&adcL, &adcM, &adcR);
 }
 
 static u8 LINE_IsBlack(u16 adc_value)
@@ -95,6 +100,10 @@ typedef struct
 	u32 wifi_override_end;
 	u8  line_lost;          /* 1 = line-lost timeout latched (no task)   */
 	u32 line_lost_ms;       /* 0 = on line, else time of first all-white */
+	u8  range_busy;         /* ultrasonic measurement in flight          */
+	u8  search_on;          /* line search: pivot phase active           */
+	u32 search_phase_ms;    /* next search phase switch                  */
+	u32 stats_prev_us;      /* previous control loop start (DWT us)      */
 } CAR_Ctx;
 
 /* ==================== 配送任务状态机(P0 任务配送闭环) ==================== */
@@ -104,11 +113,12 @@ typedef struct
  * 状态机与循迹运动分层: 本模块只负责任务流转/进站触发/停车兜底/超时,
  * 具体电机动作仍由 CAR_StepMotion 按状态执行。 */
 #define TASK_APPROACH_SPEED     200     /* 进站降速 PWM(约10~15cm/s) */
-#define TASK_TRIGGER_SAMPLES    10      /* 三路全黑连续计数(2ms/次约20ms) */
+#define TASK_TRIGGER_SAMPLES    4       /* 三路全黑连续计数(5ms/次约20ms) */
 #define TASK_STOP_FALLBACK_MS   2000    /* ENTER_STATION 后等待 STOP 上限(兜底停车) */
 #define TASK_NAV_TIMEOUT_MS     300000  /* 每段循迹 5 分钟超时 */
 #define TASK_CONFIRM_TIMEOUT_MS 300000  /* 装/卸确认 5 分钟超时(LED2 告警) */
 #define TASK_HEARTBEAT_MS       1000    /* 心跳周期 */
+#define TASK_IDEM_TTL_MS        30000UL /* duplicate command replay window */
 #define TASK_BATTERY_DEFAULT    100     /* 电量暂以固定值上报, 预留电池采样扩展 */
 
 typedef enum
@@ -142,6 +152,16 @@ typedef struct
 	u32 last_heartbeat_ms;
 	u8  armed;              /* station trigger re-arm (see CAR_TaskEnterStation) */  /* 上次心跳时刻 */
 	u32 line_lost_ms;	/* 0 = on line, else timestamp of first all-white */
+	/* Idempotency cache: a retransmitted command (same cmd+task_id+seq)
+	 * must return the previous result instead of being rejected by the
+	 * state machine (the host retries every 500 ms until it sees an ACK). */
+	u32 idem_ms;
+	u32 idem_seq;
+	u8  idem_cmd;
+	u8  idem_ok;
+	u8  idem_valid;
+	char idem_task[16];
+	char idem_reason[8];
 } CAR_TaskCtx;
 
 static CAR_TaskCtx g_task;/* 任务状态机全局(静态零初始化 = TASK_IDLE) */
@@ -257,25 +277,67 @@ static void CAR_TaskAbort(void)
 }
 
 /* 上位机任务命令入口(wifi_cmd.c 解析命令前缀后调用) */
+static u32 CAR_TaskParseSeq(const char *args)
+{
+	const char *p;
+	u32 v = 0;
+
+	if (args == 0)
+		return 0;
+	p = strstr(args, "seq=");
+	if (p == 0)
+		return 0;
+	p += 4;
+	while (*p >= '0' && *p <= '9')
+	{
+		v = v * 10U + (u32)(*p - '0');
+		p++;
+	}
+	return v;
+}
+
+/* Task command entry (called from wifi_cmd.c after strict prefix match).
+ * Idempotent: the host retransmits a command every 500 ms until ACK, so a
+ * duplicate (same cmd + task_id + seq, within TASK_IDEM_TTL_MS) replays the
+ * previous ACK instead of being rejected by the now-advanced state machine.
+ * ACK format: ACK,<task_id>,<0|1>,<reason>,seq=<n> (Qt reads field 2). */
 void CAR_OnTaskCommand(u8 cmd, char *args, u8 *line_enabled)
 {
 	char task_id[16];
 	char field_a[8];
 	char field_b[8];
 	u8 ok = 0;
+	u32 seq;
+	u32 now_ms;
+	const char *reason = "STATE";
 	const char *expect;
 
 	if (args == 0 || line_enabled == 0)
 		return;
+
 	task_id[0] = 0;
 	field_a[0] = 0;
 	field_b[0] = 0;
+	if (CAR_TaskParseField(args, 0, task_id, sizeof(task_id)) != 0)
+		return;/* no task id at all: nothing to ACK */
+
+	seq = CAR_TaskParseSeq(args);
+	now_ms = EXTIX_GetMillis();
+
+	if (g_task.idem_valid && g_task.idem_cmd == cmd &&
+	    g_task.idem_seq == seq &&
+	    strcmp(g_task.idem_task, task_id) == 0 &&
+	    (s32)(now_ms - g_task.idem_ms) <= (s32)TASK_IDEM_TTL_MS)
+	{
+		u3_printf("ACK,%s,%d,DUP,seq=%u\r\n", task_id,
+		          g_task.idem_ok ? 1 : 0, (unsigned)seq);
+		return;
+	}
 
 	switch (cmd)
 	{
 	case CAR_CMD_TASK_START:
-		if (CAR_TaskParseField(args, 0, task_id, sizeof(task_id)) == 0 &&
-		    CAR_TaskParseField(args, 1, field_a, sizeof(field_a)) == 0 &&
+		if (CAR_TaskParseField(args, 1, field_a, sizeof(field_a)) == 0 &&
 		    CAR_TaskParseField(args, 2, field_b, sizeof(field_b)) == 0)
 		{
 			if (g_task.state == TASK_IDLE)
@@ -292,17 +354,21 @@ void CAR_OnTaskCommand(u8 cmd, char *args, u8 *line_enabled)
 				g_task.line_lost_ms = 0;
 				g_task.armed = 0;
 				g_task.state = TASK_NAV_TO_LOAD;
-				g_task.nav_start_ms = EXTIX_GetMillis();
+				g_task.nav_start_ms = now_ms;
 				*line_enabled = 1;
 				ok = 1;
+				reason = "OK";
 				u3_printf("STATUS,%s,NAV\r\n", g_task.task_id);
 			}
+			else
+				reason = "BUSY";
 		}
+		else
+			reason = "BADREQ";
 		break;
 
 	case CAR_CMD_STOP:
-		if (CAR_TaskParseField(args, 0, task_id, sizeof(task_id)) == 0 &&
-		    CAR_TaskParseField(args, 1, field_a, sizeof(field_a)) == 0)
+		if (CAR_TaskParseField(args, 1, field_a, sizeof(field_a)) == 0)
 		{
 			expect = CAR_TaskTargetStation();
 			if (g_task.waiting_stop &&
@@ -310,50 +376,58 @@ void CAR_OnTaskCommand(u8 cmd, char *args, u8 *line_enabled)
 			    expect != 0 && strcmp(field_a, expect) == 0)
 			{
 				ok = 1;
+				reason = "OK";
 				CAR_TaskStopAtStation(field_a);
 			}
 		}
+		else
+			reason = "BADREQ";
 		break;
 
 	case CAR_CMD_TASK_CONFIRM:
-		if (CAR_TaskParseField(args, 0, task_id, sizeof(task_id)) == 0 &&
-		    CAR_TaskParseField(args, 1, field_a, sizeof(field_a)) == 0)
+		if (CAR_TaskParseField(args, 1, field_a, sizeof(field_a)) == 0)
 		{
 			if (strcmp(task_id, g_task.task_id) == 0)
 			{
 				if (g_task.state == TASK_WAIT_LOAD && strcmp(field_a, "load") == 0)
 				{
 					ok = 1;
+					reason = "OK";
 					g_task.seq = 1;
 					g_task.waiting_stop = 0;
 					g_task.trigger_cnt = 0;
 					g_task.line_lost_ms = 0;
 					g_task.armed = 0;
 					g_task.state = TASK_NAV_TO_WARD;
-					g_task.nav_start_ms = EXTIX_GetMillis();
+					g_task.nav_start_ms = now_ms;
 					*line_enabled = 1;
 					u3_printf("STATUS,%s,NAV\r\n", g_task.task_id);
 				}
 				else if (g_task.state == TASK_WAIT_UNLOAD && strcmp(field_a, "unload") == 0)
 				{
 					ok = 1;
+					reason = "OK";
 					u3_printf("TASK_DONE,%s\r\n", g_task.task_id);
 					g_task.state = TASK_IDLE;
 					g_task.task_id[0] = 0;
 					*line_enabled = 0;
 				}
+				else
+					reason = "BADREQ";
 			}
 		}
+		else
+			reason = "BADREQ";
 		break;
 
 	case CAR_CMD_TASK_PAUSE:
-		if (CAR_TaskParseField(args, 0, task_id, sizeof(task_id)) == 0 &&
-		    strcmp(task_id, g_task.task_id) == 0)
+		if (strcmp(task_id, g_task.task_id) == 0)
 		{
 			if (g_task.state == TASK_NAV_TO_LOAD || g_task.state == TASK_NAV_TO_WARD ||
 			    g_task.state == TASK_APPROACH_LOAD || g_task.state == TASK_APPROACH_WARD)
 			{
 				ok = 1;
+				reason = "OK";
 				g_task.paused_state = g_task.state;
 				g_task.state = TASK_PAUSED;
 				MOTOR_Stop();
@@ -363,17 +437,16 @@ void CAR_OnTaskCommand(u8 cmd, char *args, u8 *line_enabled)
 		break;
 
 	case CAR_CMD_TASK_RESUME:
-		if (CAR_TaskParseField(args, 0, task_id, sizeof(task_id)) == 0 &&
-		    strcmp(task_id, g_task.task_id) == 0)
+		if (strcmp(task_id, g_task.task_id) == 0)
 		{
 			if (g_task.state == TASK_PAUSED)
 			{
 				ok = 1;
+				reason = "OK";
 				g_task.state = g_task.paused_state;
-				g_task.nav_start_ms = EXTIX_GetMillis();
-				/* 若在进站缓行中被暂停, 恢复后重新开始兜底计时 */
+				g_task.nav_start_ms = now_ms;
 				if (g_task.state == TASK_APPROACH_LOAD || g_task.state == TASK_APPROACH_WARD)
-					g_task.enter_ms = EXTIX_GetMillis();
+					g_task.enter_ms = now_ms;
 				*line_enabled = 1;
 				u3_printf("STATUS,%s,NAV\r\n", g_task.task_id);
 			}
@@ -381,10 +454,10 @@ void CAR_OnTaskCommand(u8 cmd, char *args, u8 *line_enabled)
 		break;
 
 	case CAR_CMD_TASK_CANCEL:
-		if (CAR_TaskParseField(args, 0, task_id, sizeof(task_id)) == 0 &&
-		    strcmp(task_id, g_task.task_id) == 0)
+		if (strcmp(task_id, g_task.task_id) == 0)
 		{
 			ok = 1;
+			reason = "OK";
 			MOTOR_Stop();
 			u3_printf("STATUS,%s,CANCELLED\r\n", task_id);
 			g_task.state = TASK_IDLE;
@@ -394,17 +467,24 @@ void CAR_OnTaskCommand(u8 cmd, char *args, u8 *line_enabled)
 		break;
 
 	default:
+		reason = "UNKNOWN";
 		break;
 	}
 
-	/* 命令确认: 1=成功 0=拒绝(参数不合法/任务状态不允许) */
-	if (ok)
-		u3_printf("ACK,%s,1\r\n", task_id);
-	else if (task_id[0] != 0)
-		u3_printf("ACK,%s,0\r\n", task_id);
+	g_task.idem_valid = 1;
+	g_task.idem_ms = now_ms;
+	g_task.idem_cmd = cmd;
+	g_task.idem_seq = seq;
+	g_task.idem_ok = ok;
+	strncpy(g_task.idem_task, task_id, sizeof(g_task.idem_task) - 1);
+	g_task.idem_task[sizeof(g_task.idem_task) - 1] = 0;
+	strncpy(g_task.idem_reason, reason, sizeof(g_task.idem_reason) - 1);
+	g_task.idem_reason[sizeof(g_task.idem_reason) - 1] = 0;
+
+	u3_printf("ACK,%s,%d,%s,seq=%u\r\n", task_id, ok ? 1 : 0,
+	          reason, (unsigned)seq);
 }
 
-/* 任务处于等待/暂停/中止: 强制停车 */
 static u8 CAR_TaskHolding(void)
 {
 	return (g_task.state == TASK_WAIT_LOAD || g_task.state == TASK_WAIT_UNLOAD ||
@@ -479,7 +559,7 @@ static void CAR_StepTask(CAR_Ctx *ctx)
 			g_task.armed = 1;
 		if (!g_task.waiting_stop && g_task.armed)
 		{
-			/* 进站触发: 左中右三路全黑且连续 >=10 个采样周期(约 20ms) */
+			/* 进站触发: 左中右三路全黑且连续 >=4 个采样周期(5ms/次, 约 20ms) */
 			if (LINE_IsBlack(adcL) && LINE_IsBlack(adcM) && LINE_IsBlack(adcR))
 			{
 				if (++g_task.trigger_cnt >= TASK_TRIGGER_SAMPLES)
@@ -566,6 +646,10 @@ static void CAR_CtxInit(CAR_Ctx *ctx)
 	ctx->wifi_override_end = 0;
 	ctx->line_lost = 0;
 	ctx->line_lost_ms = 0;
+	ctx->range_busy = 0;
+	ctx->search_on = 0;
+	ctx->search_phase_ms = 0;
+	ctx->stats_prev_us = 0;
 }
 
 /* ---- 步骤1: WiFi 命令检查 ----
@@ -678,13 +762,17 @@ static void CAR_StepCamera(CAR_Ctx *ctx)
 /* ---- 步骤5: 超声波测距 + 避障逻辑 ---- */
 static void CAR_StepRange(CAR_Ctx *ctx)
 {
-	if (ctx->now_ms >= ctx->next_range_ms)
+	float distance;
+
+	/* non-blocking: trigger, then poll the EXTI-captured echo next cycles */
+	if (HC_SR04_Poll(&distance))
 	{
-		ctx->distance = HC_SR04_GetDistance();
+		ctx->range_busy = 0;
+		ctx->distance = distance;
 		RTOS_LcdLock();
 		UI_SetDistance(ctx->distance);
 		RTOS_LcdUnlock();
-		ctx->next_range_ms = EXTIX_GetMillis() + 50;
+		ctx->next_range_ms = EXTIX_GetMillis() + RANGE_SAMPLE_PERIOD_MS;
 
 		if (!UI_IsAvoidEnabled())
 		{
@@ -713,9 +801,12 @@ static void CAR_StepRange(CAR_Ctx *ctx)
 			}
 		}
 	}
+	else if (!ctx->range_busy && (ctx->now_ms >= ctx->next_range_ms))
+	{
+		ctx->range_busy = HC_SR04_Start();
+	}
 }
 
-/* ---- 步骤6: ADC 采样 + LED 心跳 + 数据页刷新 ---- */
 static void CAR_StepAdc(CAR_Ctx *ctx)
 {
 	char state_buf[12];
@@ -753,6 +844,151 @@ static void CAR_StepAdc(CAR_Ctx *ctx)
 }
 
 /* ---- 步骤7: 避障/遮挡/遥控暂停 -> 起步加速 -> 循迹逻辑 ---- */
+/* ==================== control loop timing statistics ====================
+ * DWT based: loop interval (jitter) and loop body time. Percentiles are
+ * computed on demand (STATS? command) so the hot path stays cheap.
+ */
+#define CAR_STATS_N        128
+#define CAR_OVERRUN_US    7000UL
+
+static u16 car_dt_us[CAR_STATS_N];
+static u16 car_work_us[CAR_STATS_N];
+static u8  car_stats_idx = 0;
+static u8  car_stats_fill = 0;
+static u32 car_dt_max_us = 0;
+static u32 car_work_max_us = 0;
+static u32 car_overruns = 0;
+static u32 car_cycles = 0;
+
+static void CAR_StatsRecord(u32 dt_us, u32 work_us)
+{
+	if (dt_us > 65535UL) dt_us = 65535UL;
+	if (work_us > 65535UL) work_us = 65535UL;
+
+	car_dt_us[car_stats_idx] = (u16)dt_us;
+	car_work_us[car_stats_idx] = (u16)work_us;
+	car_stats_idx = (u8)((car_stats_idx + 1) % CAR_STATS_N);
+	if (car_stats_fill < CAR_STATS_N)
+		car_stats_fill++;
+
+	if (dt_us > car_dt_max_us) car_dt_max_us = dt_us;
+	if (work_us > car_work_max_us) car_work_max_us = work_us;
+	if (dt_us > CAR_OVERRUN_US) car_overruns++;
+	car_cycles++;
+}
+
+static u16 CAR_Percentile(const u16 *src, u8 n, u8 pct)
+{
+	u16 tmp[CAR_STATS_N];
+	u16 v;
+	u8 i, j, k;
+
+	if (n == 0) return 0;
+	if (n > CAR_STATS_N) n = CAR_STATS_N;
+	for (i = 0; i < n; i++)
+		tmp[i] = src[i];
+	for (i = 1; i < n; i++)
+	{
+		v = tmp[i];
+		j = i;
+		while (j > 0 && tmp[j - 1] > v)
+		{
+			tmp[j] = tmp[j - 1];
+			j--;
+		}
+		tmp[j] = v;
+	}
+	k = (u8)(((u32)n * pct) / 100U);
+	if (k >= n) k = (u8)(n - 1);
+	return tmp[k];
+}
+
+/* Differential steering with a proportional term. The old code called
+ * MOTOR_LineTurnLeft/Right(), each of which stopped the control loop for
+ * 20 ms per step; this version never blocks. */
+static void CAR_StepSteer(CAR_Ctx *ctx, u8 *state)
+{
+	s32 base;
+	s32 err;
+	s32 delta;
+	u16 left;
+	u16 right;
+
+	base = CAR_TaskApproaching() ? TASK_APPROACH_SPEED : MOTOR_RUN_SPEED;
+	err = (s32)adcR - (s32)adcL;      /* > 0: line is to the right */
+
+	if (err > -LINE_STEER_DEADBAND && err < LINE_STEER_DEADBAND)
+	{
+		MOTOR_ForwardDual((u16)base, (u16)base);
+		ctx->last_direction = 0;
+		*state = CAR_STATE_FORWARD;
+		return;
+	}
+
+	delta = (err * base) / LINE_STEER_FULL_SCALE;
+	if (delta > base / 2) delta = base / 2;
+	if (delta < -(base / 2)) delta = -(base / 2);
+
+	left = (u16)(base + delta);
+	right = (u16)(base - delta);
+	MOTOR_ForwardDual(left, right);
+
+	if (err > 0)
+	{
+		ctx->last_direction = 1;
+		*state = CAR_STATE_TURN_RIGHT;
+	}
+	else
+	{
+		ctx->last_direction = -1;
+		*state = CAR_STATE_TURN_LEFT;
+	}
+}
+
+/* Line search: alternate pivot / settle phases without blocking. */
+static void CAR_StepSearch(CAR_Ctx *ctx, u8 *state)
+{
+	if (ctx->search_phase_ms == 0)
+	{
+		ctx->search_on = 1;
+		ctx->search_phase_ms = EXTIX_GetMillis() + LINE_SEARCH_PIVOT_MS;
+	}
+
+	if ((s32)(EXTIX_GetMillis() - ctx->search_phase_ms) >= 0)
+	{
+		ctx->search_on = (u8)!ctx->search_on;
+		ctx->search_phase_ms = EXTIX_GetMillis() +
+		        (ctx->search_on ? LINE_SEARCH_PIVOT_MS : LINE_SEARCH_SETTLE_MS);
+	}
+
+	if (ctx->search_on && ctx->last_direction != 0)
+	{
+		if (ctx->last_direction < 0)
+		{
+			MOTOR_TurnLeft(LINE_PIVOT_SPEED);
+			*state = CAR_STATE_SEARCH_LEFT;
+		}
+		else
+		{
+			MOTOR_TurnRight(LINE_PIVOT_SPEED);
+			*state = CAR_STATE_SEARCH_RIGHT;
+		}
+	}
+	else
+	{
+		MOTOR_Stop();
+		*state = CAR_STATE_STOP;
+	}
+}
+
+static void CAR_StatsTick(CAR_Ctx *ctx, u32 t0_us)
+{
+	u32 now = DWT_Micros();
+
+	CAR_StatsRecord(now - ctx->stats_prev_us, now - t0_us);
+	ctx->stats_prev_us = t0_us;
+}
+
 static void CAR_StepMotion(CAR_Ctx *ctx)
 {
 	u8 state = CAR_STATE_STOP;
@@ -800,43 +1036,11 @@ static void CAR_StepMotion(CAR_Ctx *ctx)
 	/* 循迹逻辑: 仅在 WiFi 遥控未激活时执行 */
 	else if (!LINE_IsBlack(adcL) && !LINE_IsBlack(adcM) && !LINE_IsBlack(adcR))
 	{
-		if (ctx->last_direction < 0)
-		{
-			MOTOR_LineSearchLeft();
-			state = CAR_STATE_SEARCH_LEFT;
-		}
-		else if (ctx->last_direction > 0)
-		{
-			MOTOR_LineSearchRight();
-			state = CAR_STATE_SEARCH_RIGHT;
-		}
-		else
-		{
-			MOTOR_Stop();
-			state = CAR_STATE_STOP;
-		}
-	}
-	else if (((u32)adcM + LINE_CENTER_TOLERANCE >= adcL) &&
-	         ((u32)adcM + LINE_CENTER_TOLERANCE >= adcR))
-	{
-		if (CAR_TaskApproaching())
-			MOTOR_LineForwardSpeed(TASK_APPROACH_SPEED);/* 进站缓行降速 */
-		else
-			MOTOR_LineForward();
-		ctx->last_direction = 0;
-		state = CAR_STATE_FORWARD;
-	}
-	else if (adcL > adcR)
-	{
-		MOTOR_LineTurnLeft();
-		ctx->last_direction = -1;
-		state = CAR_STATE_TURN_LEFT;
+		CAR_StepSearch(ctx, &state);
 	}
 	else
 	{
-		MOTOR_LineTurnRight();
-		ctx->last_direction = 1;
-		state = CAR_STATE_TURN_RIGHT;
+		CAR_StepSteer(ctx, &state);
 	}
 
 	g_car_state = state;
@@ -862,16 +1066,48 @@ void CAR_GetState(char *buf)
 	}
 }
 
+/* On-demand timing report (STATS command). Percentiles are calculated from
+ * the last <=128 control cycles: dt = loop interval (jitter), work = body. */
+void CAR_PrintStats(void)
+{
+	u8 n = car_stats_fill;
+	u16 dt50, dt99, dtmax, w50, w99, wmax;
+
+	if (n == 0)
+	{
+		u3_printf("STATS,n=0\r\n");
+		return;
+	}
+	dt50 = CAR_Percentile(car_dt_us, n, 50);
+	dt99 = CAR_Percentile(car_dt_us, n, 99);
+	w50 = CAR_Percentile(car_work_us, n, 50);
+	w99 = CAR_Percentile(car_work_us, n, 99);
+	dtmax = (car_dt_max_us > 65535UL) ? 65535U : (u16)car_dt_max_us;
+	wmax = (car_work_max_us > 65535UL) ? 65535U : (u16)car_work_max_us;
+	u3_printf("STATS,dt50=%u,dt99=%u,dtmax=%u,w50=%u,w99=%u,wmax=%u,ovr=%u,n=%u,wdg=%u,txov=%u\r\n",
+	          (unsigned)dt50, (unsigned)dt99, (unsigned)dtmax,
+	          (unsigned)w50, (unsigned)w99, (unsigned)wmax,
+	          (unsigned)car_overruns, (unsigned)car_cycles,
+	          (unsigned)WDG_GetMissed(), (unsigned)USART3_TextOverflow());
+	u3_printf("STATS2,vid_drop=%u,rxov=%u,ore=%u\r\n",
+	          (unsigned)JPEG_TxDropped(),
+	          (unsigned)USART3_GetRxOverflow(),
+	          (unsigned)USART3_GetRxOre());
+}
+
 /* ==================== 裸机主循环: 保持原有行为 ==================== */
 void CAR_LineFollow(void)
 {
 	CAR_Ctx ctx;
+	u32 t0_us;
 
 	CAR_CtxInit(&ctx);
 	ctx.startup_end_ms = EXTIX_GetMillis() + MOTOR_START_TIME_MS;
+	ctx.stats_prev_us = DWT_Micros();
 
 	while (1)
 	{
+		t0_us = DWT_Micros();
 		ctx.now_ms = EXTIX_GetMillis();
 
 		CAR_StepWifi(&ctx);
@@ -886,29 +1122,33 @@ void CAR_LineFollow(void)
 		CAR_StepMotion(&ctx);
 		WDG_Feed();/* single loop: a full pass proves liveness */
 		USART3_TextPump();
+		CAR_StatsTick(&ctx, t0_us);
 	}
 }
 
 #if RTOS_ENABLE
 /* ==================== RTOS 主控任务 ====================
- * 周期 2ms, 复用与裸机完全相同的步骤函数(除 UI/JPEG 由独立任务承担)。
- * WiFi 命令经队列送达, 超声波测距的 30ms 忙等不再阻塞 UI/图传任务。 */
-#define CAR_CONTROL_PERIOD_TICKS   2
+ * 周期 5ms, 复用与裸机完全相同的步骤函数(除 UI/JPEG 由独立任务承担)。
+ * WiFi 命令经队列送达; 测距/ADC/转向均为非阻塞步骤, UI/图传任务不被拖住。 */
+#define CAR_CONTROL_PERIOD_MS      5
 
 void vTaskCarControl(void *pvParameters)
 {
-	CAR_Ctx ctx;/*创建小车参数结构体*/
+	CAR_Ctx ctx;
 	TickType_t xLastWake;
-	u32 wdg_last_ms = 0;/*获取当前系统滴答数*/
+	u32 wdg_last_ms = 0;
+	u32 t0_us;
 
 	(void)pvParameters;/*避免编译器警告*/
 	CAR_CtxInit(&ctx);
 	ctx.startup_end_ms = EXTIX_GetMillis() + MOTOR_START_TIME_MS;/*小车启动时间*/
 
 	xLastWake = xTaskGetTickCount();
+	ctx.stats_prev_us = DWT_Micros();
 	while (1)
 	{
-		vTaskDelayUntil(&xLastWake, CAR_CONTROL_PERIOD_TICKS);
+		vTaskDelayUntil(&xLastWake, pdMS_TO_TICKS(CAR_CONTROL_PERIOD_MS));
+		t0_us = DWT_Micros();
 
 		WDG_TaskTick(WDG_TASK_CONTROL);
 		if ((u32)(EXTIX_GetMillis() - wdg_last_ms) >= 200)
@@ -926,6 +1166,7 @@ void vTaskCarControl(void *pvParameters)
 		CAR_StepAdc(&ctx);
 		CAR_StepTask(&ctx);
 		CAR_StepMotion(&ctx);
+		CAR_StatsTick(&ctx, t0_us);
 	}
 }
 #endif

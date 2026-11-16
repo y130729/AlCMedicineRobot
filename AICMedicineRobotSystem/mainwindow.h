@@ -5,6 +5,7 @@
 #include <QTimer>
 #include <QObject>
 #include <QDebug>
+#include <QByteArray>
 #include <QTcpServer>
 #include <QTcpSocket>
 
@@ -90,7 +91,7 @@ private:
     // ---- P0 任务配送协议 ----
     bool isProtocolTextLine(const QByteArray &line) const;
     void handleProtocolLine(const QByteArray &line);
-    void handleAck(const QString &taskId, bool ok);
+    void handleAck(const QString &taskId, bool ok, const QString &reason = QString());
     void handleStatus(const QString &taskId, const QString &state);
     void handleEnterStation(const QString &taskId, int seq);
     void handleArrive(const QString &taskId, const QString &stationId, const QString &flag = QString());
@@ -138,6 +139,9 @@ private:
     QTcpSocket *m_videoSocket;
     QByteArray m_recvBuffer;
     QPixmap m_pixmap;
+    // Chunked video reassembly (AA55A55A packets)
+    QByteArray m_jpegAssembly;
+    int m_jpegExpected = 0;
 
     // 手动控制弹窗
     ManualControlDialog *m_manualDlg;
@@ -148,6 +152,7 @@ private:
     QString m_pendingTaskId;           // 正在等待 ACK 的任务
     QString m_pendingCmd;              // 待确认的完整下行命令(重发用)
     int m_ackRetryCount;               // 已重发次数
+    quint32 m_cmdSeq;                  // per-command idempotency key (seq=)
     QTimer *m_onlineTimer;             // 在线检测定时器(3s)
     qint64 m_lastHeartbeatMs;          // 最近一次心跳时间(离线判定)
     bool m_wifiOnline;                 // 小车在线标志

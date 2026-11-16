@@ -93,7 +93,9 @@ void DMA1_Stream3_IRQHandler(void)
 		/* if the finished transfer was queued text, keep draining it */
 		owner = usart3_tx_owner;
 		usart3_tx_owner = 0;
-		if (owner == 1)
+		/* both queue drains and finished video chunks release the link:
+		 * send any control text before the next chunk starts */
+		if (owner != 0)
 			USART3_TextPump();
 	}
 }
@@ -164,70 +166,124 @@ void jpeg_frame_callback(void)
 }
 
 /* ==================== JPEG 帧处理与发送 ==================== */
+/* ==================== JPEG chunked TX (QoS) ====================
+ * A frame no longer monopolises the link for 200-400 ms. It is split into
+ * VIDEO_CHUNK_SIZE payloads, each in a self-delimiting packet:
+ *
+ *   AA 55 A5 5A | total(2) | offset(2) | len(2) | payload(len) | CRC16(2)
+ *
+ * USART3_TextPump() gets a chance between every chunk, so an ACK or
+ * LINK,DOWN queued while a frame is in flight goes out after at most one
+ * chunk (~2.6 ms at 921600) instead of waiting for the whole JPEG. The host
+ * reassembles by offset; a lost/reordered packet is detected by CRC/length.
+ * At low baud (115200) video is skipped entirely to protect the 500 ms ACK
+ * budget; control traffic always wins.
+ */
+#define VIDEO_CHUNK_SIZE   256
+#define VIDEO_PKT_HEADER   10
+#define VIDEO_PKT_MAX      (VIDEO_PKT_HEADER + VIDEO_CHUNK_SIZE + 2)
+#define VIDEO_MIN_BAUD     460800UL
+#define VIDEO_MAX_TOTAL    60000UL
+
+static u8  video_pkt[VIDEO_PKT_MAX];
+static u32 video_total = 0;
+static u32 video_off = 0;
+static u32 video_start = 0;
+static u8  video_active = 0;
+static u32 video_dropped = 0;
+
+void JPEG_TxAbort(void)
+{
+	if (video_active)
+		video_dropped++;/* aborted mid-frame: host waits for a fresh offset 0 */
+	video_active = 0;
+	video_total = 0;
+	video_off = 0;
+	if (jpeg_data_ok == 1)
+		jpeg_data_ok = 2;
+}
+
+u32 JPEG_TxDropped(void)
+{
+	return video_dropped;
+}
+
 int jpeg_process_and_send(void)
 {
 	u8 *p;
 	u32 i, jpgstart = 0, jpglen = 0;
 	u8 headok = 0;
 	uint32_t bufBytes;
-	uint8_t *sendPtr;
-	uint32_t sendLen;
-	uint32_t hdrOff;
 	uint16_t crc;
+	u32 n;
 
 	if (jpeg_data_ok != 1)
 		return 0;
+	if (USART3_GetBaud() < VIDEO_MIN_BAUD)
+		return 0;/* protect the control ACK budget on a slow link */
+
 	p = (u8 *)jpeg_buf;
 	bufBytes = jpeg_data_len * 4;
 
-	for (i = 0; i + 1 < bufBytes; ++i)
+	if (!video_active)
 	{
-		if (!headok && p[i] == 0xFF && p[i + 1] == 0xD8) {
-			jpgstart = i;
-			headok = 1;
+		for (i = 0; i + 1 < bufBytes; ++i)
+		{
+			if (!headok && p[i] == 0xFF && p[i + 1] == 0xD8)
+			{
+				jpgstart = i;
+				headok = 1;
+			}
+			else if (headok && p[i] == 0xFF && p[i + 1] == 0xD9)
+			{
+				jpglen = i - jpgstart + 2;
+				break;
+			}
 		}
-		else if (headok && p[i] == 0xFF && p[i + 1] == 0xD9) {
-			jpglen = i - jpgstart + 2;
-			break;
+		if (jpglen == 0 || jpglen > VIDEO_MAX_TOTAL)
+		{
+			jpeg_data_ok = 2;
+			return 0;
 		}
+		video_start = jpgstart;
+		video_total = jpglen;
+		video_off = 0;
+		video_active = 1;
 	}
 
-	if (jpglen == 0) { jpeg_data_ok = 2; return 0; }
-
-	if (jpgstart >= 6) {
-		hdrOff = jpgstart - 6;
-		if (jpgstart + jpglen + 2 > bufBytes) { jpeg_data_ok = 2; return 0; }
-		p[hdrOff + 0] = 0xAA;
-		p[hdrOff + 1] = 0x55;
-		p[hdrOff + 2] = (uint8_t)(jpglen & 0xFF);
-		p[hdrOff + 3] = (uint8_t)((jpglen >> 8) & 0xFF);
-		p[hdrOff + 4] = (uint8_t)((jpglen >> 16) & 0xFF);
-		p[hdrOff + 5] = (uint8_t)((jpglen >> 24) & 0xFF);
-		sendPtr = &p[hdrOff];
-		sendLen = jpgstart - hdrOff + jpglen;
-	} else {
-		if (6 + jpglen + 2 > bufBytes) { jpeg_data_ok = 2; return 0; }
-		memmove(p + 6, p + jpgstart, jpglen);
-		jpgstart = 6;
-		p[0] = 0xAA;
-		p[1] = 0x55;
-		p[2] = (uint8_t)(jpglen & 0xFF);
-		p[3] = (uint8_t)((jpglen >> 8) & 0xFF);
-		p[4] = (uint8_t)((jpglen >> 16) & 0xFF);
-		p[5] = (uint8_t)((jpglen >> 24) & 0xFF);
-		sendPtr = p;
-		sendLen = 6 + jpglen;
-	}
-
-	crc = crc16_ccitt(sendPtr + 6, jpglen);
-	sendPtr[sendLen + 0] = (uint8_t)(crc & 0xFF);
-	sendPtr[sendLen + 1] = (uint8_t)((crc >> 8) & 0xFF);
-	sendLen += 2;
-
-	/* Claim the shared TX stream; if text is mid-burst, retry on the next
-	 * call (the frame preparation above is idempotent). */
-	if (!USART3_DMA_TryStart(sendPtr, sendLen, 2))
+	/* Control traffic has priority: wait for the text queue to drain. */
+	if (USART3_TextPending() > 0)
+		return 0;/* deferred, not lost: the same frame resumes next tick */
+	if (USART3_DMA_IsBusy())
 		return 0;
-	jpeg_data_ok = 2;
+
+	n = video_total - video_off;
+	if (n > VIDEO_CHUNK_SIZE)
+		n = VIDEO_CHUNK_SIZE;
+
+	video_pkt[0] = 0xAA;
+	video_pkt[1] = 0x55;
+	video_pkt[2] = 0xA5;
+	video_pkt[3] = 0x5A;
+	video_pkt[4] = (u8)(video_total & 0xFF);
+	video_pkt[5] = (u8)((video_total >> 8) & 0xFF);
+	video_pkt[6] = (u8)(video_off & 0xFF);
+	video_pkt[7] = (u8)((video_off >> 8) & 0xFF);
+	video_pkt[8] = (u8)(n & 0xFF);
+	video_pkt[9] = (u8)((n >> 8) & 0xFF);
+	memcpy(&video_pkt[VIDEO_PKT_HEADER], &p[video_start + video_off], n);
+	crc = crc16_ccitt(&video_pkt[VIDEO_PKT_HEADER], n);
+	video_pkt[VIDEO_PKT_HEADER + n] = (u8)(crc & 0xFF);
+	video_pkt[VIDEO_PKT_HEADER + n + 1] = (u8)((crc >> 8) & 0xFF);
+
+	if (!USART3_DMA_TryStart(video_pkt, VIDEO_PKT_HEADER + n + 2, 2))
+		return 0;
+
+	video_off += n;
+	if (video_off >= video_total)
+	{
+		video_active = 0;
+		jpeg_data_ok = 2;
+	}
 	return 1;
 }

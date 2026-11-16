@@ -4,123 +4,143 @@
 extern vu16 USART3_RX_STA;
 extern vu16 USART2_RX_STA;
 
-#define HC_SR04_SAMPLE_COUNT       1
-#define HC_SR04_ECHO_TIMEOUT_US 30000
+/* ==================== HC-SR04 (non blocking) ====================
+ * PF3 is not a timer channel on the STM32F407, so the echo pulse is timed
+ * with EXTI3 (both edges) plus the DWT cycle counter instead of a blocking
+ * delay loop. HC_SR04_Start() only emits the 11 us trigger; the control loop
+ * polls HC_SR04_Poll() and never stalls waiting for the echo.
+ * The old implementation blocked the control loop for up to 60 ms.
+ */
+#define HC_SR04_TRIG_US            11U
+#define HC_SR04_ECHO_TIMEOUT_US 45000UL
+#define HC_SR04_MIN_PULSE_US      100UL
+#define HC_SR04_MAX_PULSE_US    30000UL
 
-static volatile u32 tim3_overflow_count = 0;
+#define HC_SR04_IDLE        0
+#define HC_SR04_WAIT_RISE   1
+#define HC_SR04_WAIT_FALL   2
+#define HC_SR04_DONE        3
 
-void TIM3_Int_Init(u16 arr, u16 psc)
-{
-	TIM_TimeBaseInitTypeDef TIM_TimeBaseInitStructure;
-	NVIC_InitTypeDef NVIC_InitStructure;
-
-	RCC_APB1PeriphClockCmd(RCC_APB1Periph_TIM3, ENABLE);
-
-	TIM_TimeBaseStructInit(&TIM_TimeBaseInitStructure);
-	TIM_TimeBaseInitStructure.TIM_Period = arr;
-	TIM_TimeBaseInitStructure.TIM_Prescaler = psc;
-	TIM_TimeBaseInitStructure.TIM_CounterMode = TIM_CounterMode_Up;
-	TIM_TimeBaseInitStructure.TIM_ClockDivision = TIM_CKD_DIV1;
-	TIM_TimeBaseInit(TIM3, &TIM_TimeBaseInitStructure);
-
-	TIM_ClearITPendingBit(TIM3, TIM_IT_Update);
-	TIM_ITConfig(TIM3, TIM_IT_Update, ENABLE);
-
-	NVIC_InitStructure.NVIC_IRQChannel = TIM3_IRQn;
-	NVIC_InitStructure.NVIC_IRQChannelPreemptionPriority = 1;
-	NVIC_InitStructure.NVIC_IRQChannelSubPriority = 3;
-	NVIC_InitStructure.NVIC_IRQChannelCmd = ENABLE;
-	NVIC_Init(&NVIC_InitStructure);
-
-	/* 测量回波脉宽时才启动TIM3 */
-	TIM_Cmd(TIM3, DISABLE);
-}
-
-void TIM3_IRQHandler(void)
-{
-	if(TIM_GetITStatus(TIM3, TIM_IT_Update) != RESET)
-	{
-		TIM_ClearITPendingBit(TIM3, TIM_IT_Update);
-		tim3_overflow_count++;
-	}
-}
+static volatile u8  hc_state = HC_SR04_IDLE;
+static volatile u32 hc_t0_us = 0;
+static volatile u32 hc_start_us = 0;
+static volatile u32 hc_pulse_us = 0;
+static volatile u32 hc_timeouts = 0;
 
 void HC_SR04_Init(void)
 {
-	GPIO_InitTypeDef GPIO_InitStructure;
+	GPIO_InitTypeDef gpio;
+	EXTI_InitTypeDef exti;
+	NVIC_InitTypeDef nvic;
 
 	RCC_AHB1PeriphClockCmd(RCC_AHB1Periph_GPIOF, ENABLE);
+	RCC_APB2PeriphClockCmd(RCC_APB2Periph_SYSCFG, ENABLE);
 
-	GPIO_InitStructure.GPIO_Pin = GPIO_Pin_2;
-	GPIO_InitStructure.GPIO_Mode = GPIO_Mode_OUT;
-	GPIO_InitStructure.GPIO_OType = GPIO_OType_PP;
-	GPIO_InitStructure.GPIO_Speed = GPIO_Speed_50MHz;
-	GPIO_InitStructure.GPIO_PuPd = GPIO_PuPd_DOWN;
-	GPIO_Init(GPIOF, &GPIO_InitStructure);
+	/* TRIG = PF2 (output) */
+	gpio.GPIO_Pin = GPIO_Pin_2;
+	gpio.GPIO_Mode = GPIO_Mode_OUT;
+	gpio.GPIO_OType = GPIO_OType_PP;
+	gpio.GPIO_Speed = GPIO_Speed_50MHz;
+	gpio.GPIO_PuPd = GPIO_PuPd_DOWN;
+	GPIO_Init(GPIOF, &gpio);
 	GPIO_ResetBits(GPIOF, GPIO_Pin_2);
 
-	GPIO_InitStructure.GPIO_Pin = GPIO_Pin_3;
-	GPIO_InitStructure.GPIO_Mode = GPIO_Mode_IN;
-	GPIO_InitStructure.GPIO_PuPd = GPIO_PuPd_DOWN;
-	GPIO_Init(GPIOF, &GPIO_InitStructure);
+	/* ECHO = PF3 (input, both edges) */
+	gpio.GPIO_Pin = GPIO_Pin_3;
+	gpio.GPIO_Mode = GPIO_Mode_IN;
+	gpio.GPIO_PuPd = GPIO_PuPd_DOWN;
+	GPIO_Init(GPIOF, &gpio);
+
+	SYSCFG_EXTILineConfig(EXTI_PortSourceGPIOF, EXTI_PinSource3);
+	exti.EXTI_Line = EXTI_Line3;
+	exti.EXTI_Mode = EXTI_Mode_Interrupt;
+	exti.EXTI_Trigger = EXTI_Trigger_Rising_Falling;
+	exti.EXTI_LineCmd = ENABLE;
+	EXTI_Init(&exti);
+
+	nvic.NVIC_IRQChannel = EXTI3_IRQn;
+	nvic.NVIC_IRQChannelPreemptionPriority = 1;/* above the 1 ms tick */
+	nvic.NVIC_IRQChannelSubPriority = 1;
+	nvic.NVIC_IRQChannelCmd = ENABLE;
+	NVIC_Init(&nvic);
 }
 
-static u8 HC_SR04_WaitEcho(BitAction state, u32 timeout_us)
+void EXTI3_IRQHandler(void)
 {
-	while(GPIO_ReadInputDataBit(GPIOF, GPIO_Pin_3) != state)
+	u32 now;
+
+	if (EXTI_GetITStatus(EXTI_Line3) == RESET)
+		return;
+	EXTI_ClearITPendingBit(EXTI_Line3);
+
+	now = DWT_Micros();
+	if (GPIO_ReadInputDataBit(GPIOF, GPIO_Pin_3))
 	{
-		if(timeout_us == 0)
-			return 0;
-
-		timeout_us--;
-		delay_us(1);
+		if (hc_state == HC_SR04_WAIT_RISE)
+		{
+			hc_t0_us = now;
+			hc_state = HC_SR04_WAIT_FALL;
+		}
 	}
+	else if (hc_state == HC_SR04_WAIT_FALL)
+	{
+		hc_pulse_us = now - hc_t0_us;
+		hc_state = HC_SR04_DONE;
+	}
+}
 
+/* 1 = trigger emitted, 0 = previous measurement still in flight */
+u8 HC_SR04_Start(void)
+{
+	if (hc_state != HC_SR04_IDLE)
+		return 0;
+
+	HC_SR04_TRIG = 1;
+	delay_us(HC_SR04_TRIG_US);
+	HC_SR04_TRIG = 0;
+
+	hc_start_us = DWT_Micros();
+	hc_state = HC_SR04_WAIT_RISE;
 	return 1;
 }
 
-float HC_SR04_GetDistance(void)
+/* 1 = result ready (distance valid, or -1.0f on timeout) */
+u8 HC_SR04_Poll(float *distance)
 {
-	float distance_sum = 0.0f;
-	u32 pulse_us;
-	u16 counter;
-	u8 valid_samples = 0;
-	u8 i;
+	u32 pulse;
 
-	for(i = 0; i < HC_SR04_SAMPLE_COUNT; i++)
+	if (hc_state == HC_SR04_DONE)
 	{
-		HC_SR04_TRIG = 1;
-		delay_us(11);
-		HC_SR04_TRIG = 0;
-
-		if(!HC_SR04_WaitEcho(Bit_SET, HC_SR04_ECHO_TIMEOUT_US))
-			continue;
-
-		tim3_overflow_count = 0;
-		TIM_SetCounter(TIM3, 0);
-		TIM_ClearITPendingBit(TIM3, TIM_IT_Update);
-		TIM_Cmd(TIM3, ENABLE);
-
-		if(!HC_SR04_WaitEcho(Bit_RESET, HC_SR04_ECHO_TIMEOUT_US))
+		pulse = hc_pulse_us;
+		hc_state = HC_SR04_IDLE;
+		if (pulse >= HC_SR04_MIN_PULSE_US && pulse <= HC_SR04_MAX_PULSE_US)
 		{
-			TIM_Cmd(TIM3, DISABLE);
-			continue;
+			if (distance) *distance = (float)pulse / 58.0f;
+			return 1;
 		}
-
-		TIM_Cmd(TIM3, DISABLE);
-		counter = TIM_GetCounter(TIM3);
-		pulse_us = tim3_overflow_count * 1000UL + counter;
-		distance_sum += pulse_us / 58.0f;
-		valid_samples++;
+		if (distance) *distance = -1.0f;
+		return 1;
 	}
 
-	if(valid_samples == 0)
-		return -1.0f;
-
-	return distance_sum / valid_samples;
+	if (hc_state == HC_SR04_WAIT_RISE || hc_state == HC_SR04_WAIT_FALL)
+	{
+		if ((DWT_Micros() - hc_start_us) > HC_SR04_ECHO_TIMEOUT_US)
+		{
+			hc_state = HC_SR04_IDLE;
+			hc_timeouts++;
+			if (distance) *distance = -1.0f;
+			return 1;
+		}
+	}
+	return 0;
 }
 
-// TIM7 用于 USART2/USART3 接收超时判断
+u32 HC_SR04_GetTimeouts(void)
+{
+	return hc_timeouts;
+}
+
+/* TIM7 drives the USART2/USART3 receive frame gap (100 ms) */
 void TIM7_Int_Init(u16 arr, u16 psc)
 {
 	NVIC_InitTypeDef NVIC_InitStructure;

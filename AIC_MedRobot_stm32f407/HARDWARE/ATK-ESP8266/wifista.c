@@ -49,73 +49,113 @@ static void atk_8266_query_local_ip(void)
 //    其他,失败
 //网络参数统一在 wifi_config.h 中配置
 
-void atk_8266_wifista_config(void)
+/* Bounded boot sequence. Returns 0 when the TCP link is up, 1 on timeout.
+ * Every step has a retry cap and the whole sequence has a deadline, so a
+ * missing AP / wrong password / missing server can no longer hang the boot
+ * (the old code retried forever before the watchdog was even started). */
+#define WIFI_BOOT_TIMEOUT_MS   30000UL
+#define WIFI_BOOT_RETRY        5
+
+u8 atk_8266_wifista_config(void)
 {
-	while (atk_8266_send_cmd("AT+RST", "OK", 50))
-	{
-		LCD_ShowString(30, 170, 210, 24, 16, "     ");
-		LCD_ShowString(30, 170, 210, 24, 16, "RST");
-		delay_ms(1000);
-	}
+	char cmd[96];
+	u8 step = 0;
+	u8 retry = 0;
+	u32 t0 = EXTIX_GetMillis();
 
-	while (atk_8266_send_cmd("AT+CWMODE=1", "OK", 50))
+	while (step < 8)
 	{
-		LCD_ShowString(30, 170, 210, 24, 16, "     ");
-		LCD_ShowString(30, 170, 210, 24, 16, "CWMODE");
-		delay_ms(1000);
-	}
-
-	/* 连接 wifi_config.h 中配置的 AP */
-	{
-		char cwjap_cmd[96];
-		sprintf(cwjap_cmd, "AT+CWJAP=\"%s\",\"%s\"", WIFI_STA_SSID, WIFI_STA_PASSWORD);
-		while (atk_8266_send_cmd((u8 *)cwjap_cmd, "WIFI GOT IP", 600))
+		if ((s32)(EXTIX_GetMillis() - t0) > (s32)WIFI_BOOT_TIMEOUT_MS)
 		{
-			LCD_ShowString(30, 170, 210, 24, 16, "     ");
-			LCD_ShowString(30, 170, 210, 24, 16, "CWJAP");
-			delay_ms(1000);
+			printf("BOOT_TIMEOUT,step=%d\r\n", step);
+			wifi_online = 0;
+			return 1;
+		}
+
+		switch (step)
+		{
+		case 0:  /* module reset */
+			if (atk_8266_send_cmd("AT+RST", "OK", 50) == 0) { step++; retry = 0; }
+			else if (++retry >= WIFI_BOOT_RETRY) { wifi_online = 0; return 1; }
+			else { LCD_ShowString(30, 170, 210, 24, 16, "RST          "); delay_ms(500); }
+			break;
+
+		case 1:  /* station mode */
+			if (atk_8266_send_cmd("AT+CWMODE=1", "OK", 50) == 0) { step++; retry = 0; }
+			else if (++retry >= WIFI_BOOT_RETRY) { wifi_online = 0; return 1; }
+			else { LCD_ShowString(30, 170, 210, 24, 16, "CWMODE       "); delay_ms(500); }
+			break;
+
+		case 2:  /* join AP */
+			sprintf(cmd, "AT+CWJAP=\"%s\",\"%s\"", WIFI_STA_SSID, WIFI_STA_PASSWORD);
+			if (atk_8266_send_cmd((u8 *)cmd, "WIFI GOT IP", 600) == 0)
+			{
+				atk_8266_query_local_ip();
+				step++;
+				retry = 0;
+			}
+			else if (++retry >= 3)
+			{
+				wifi_online = 0;
+				return 1;
+			}
+			else
+			{
+				LCD_ShowString(30, 170, 210, 24, 16, "CWJAP        ");
+				delay_ms(500);
+			}
+			break;
+
+		case 3:  /* optional 921600 baud, never fatal */
+			if (atk_8266_send_cmd("AT+UART_DEF=921600,8,1,0,0", "OK", 200) == 0)
+			{
+				usart3_set_baudrate(921600);
+				delay_ms(50);
+			}
+			step++;
+			retry = 0;
+			break;
+
+		case 4:  /* single connection */
+			if (atk_8266_send_cmd("AT+CIPMUX=0", "OK", 200) == 0) { step++; retry = 0; }
+			else if (++retry >= WIFI_BOOT_RETRY) { wifi_online = 0; return 1; }
+			else { LCD_ShowString(30, 170, 210, 24, 16, "CIPMUX       "); delay_ms(200); }
+			break;
+
+		case 5:  /* open TCP */
+			sprintf(cmd, "AT+CIPSTART=\"TCP\",\"%s\",%s", WIFI_SERVER_IP, WIFI_SERVER_PORT);
+			if (atk_8266_send_cmd((u8 *)cmd, "OK", 300) == 0) { step++; retry = 0; }
+			else if (++retry >= WIFI_BOOT_RETRY) { wifi_online = 0; return 1; }
+			else { LCD_ShowString(30, 170, 210, 24, 16, "CIPSTART     "); delay_ms(200); }
+			break;
+
+		case 6:
+			atk_8266_send_cmd("AT+CIPMODE=1", "OK", 200);
+			step++;
+			break;
+
+		case 7:
+			if (atk_8266_send_cmd("AT+CIPSEND", "OK", 200) == 0)
+			{
+				wifi_online = 1;
+				WIFI_LinkInit();
+				step++;
+			}
+			else if (++retry >= 3)
+			{
+				wifi_online = 0;
+				return 1;
+			}
+			break;
+
+		default:
+			step++;
+			break;
 		}
 	}
 
-	/* CWJAP ok: mark online and cache local IP before transparent mode */
-	wifi_online = 1;
-	atk_8266_query_local_ip();
-
-	/* 图传前临时提升串口波特率: 模块收到 OK 后切换, 随后把 USART3 调到同速。
-	 * 若模块不支持 AT+UART_DEF(旧固件), 则保持 115200 继续, 不影响功能。 */
-	if (atk_8266_send_cmd("AT+UART_DEF=921600,8,1,0,0", "OK", 200) == 0)
-	{
-		usart3_set_baudrate(921600);
-		delay_ms(50);
-	}
-
-	while (atk_8266_send_cmd("AT+CIPMUX=0", "OK", 200))
-	{
-		LCD_ShowString(30, 170, 210, 24, 16, "     ");
-		LCD_ShowString(30, 170, 210, 24, 16, "CIPMUX");
-		delay_ms(200);
-	}
-
-	/* 连接 wifi_config.h 中配置的 TCP 服务器 */
-	{
-		char cipstart_cmd[96];
-		sprintf(cipstart_cmd, "AT+CIPSTART=\"TCP\",\"%s\",%s", WIFI_SERVER_IP, WIFI_SERVER_PORT);
-		while (atk_8266_send_cmd((u8 *)cipstart_cmd, "OK", 1000))
-		{
-			LCD_ShowString(30, 170, 210, 24, 16, "     ");
-			LCD_ShowString(30, 170, 210, 24, 16, "CIPSTART");
-			delay_ms(200);
-		}
-	}
-
-	atk_8266_send_cmd("AT+CIPMODE=1", "OK", 200);      //设置为透传模式
 	delay_ms(200);
-
-	LCD_ShowString(30, 170, 210, 24, 16, "             ");
-	LCD_ShowString(30, 170, 210, 24, 16, "connect success");
-	atk_8266_send_cmd("AT+CIPSEND", "OK", 200);
-	WIFI_LinkInit();/* start link supervision in the UP state */       //开启透传模式
-	delay_ms(200);
+	return 0;
 }
 
 /* ==================== Network info accessors ==================== */
@@ -211,6 +251,24 @@ void WIFI_LinkInit(void)
 	wifi_lk_backoff_ms = WIFI_LK_BACKOFF_MIN;
 }
 
+/* Boot could not bring the link up (bounded sequence timed out). Enter the
+ * same non-blocking recovery ladder used for runtime link loss, so the car
+ * keeps running offline and retries in the background. */
+void WIFI_LinkStartRecovery(void)
+{
+	if (wifi_lk_st != WIFI_LK_UP || wifi_lk_recovering)
+		return;
+	wifi_lk_recovering = 1;
+	wifi_lk_count++;
+	wifi_lk_retry = 0;
+	wifi_lk_round = 0;
+	wifi_lk_backoff_ms = WIFI_LK_BACKOFF_MIN;
+	wifi_online = 0;
+	JPEG_TxAbort();/* no partial frame across a new TCP connection */
+	u3_printf("LINK,DOWN\r\n");
+	wifi_lk_goto(WIFI_LK_ESCAPE);
+}
+
 /* Called with every received line: start recovery on link-loss markers. */
 void WIFI_LinkOnRxLine(const char *line)
 {
@@ -227,6 +285,7 @@ void WIFI_LinkOnRxLine(const char *line)
 		wifi_lk_round = 0;
 		wifi_lk_backoff_ms = WIFI_LK_BACKOFF_MIN;
 		wifi_online = 0;
+		JPEG_TxAbort();/* host will get a fresh frame from offset 0 */
 		u3_printf("LINK,DOWN\r\n");
 		wifi_lk_goto(WIFI_LK_ESCAPE);
 	}
@@ -249,7 +308,7 @@ void WIFI_LinkPoll(void)
 	case WIFI_LK_ESCAPE:
 		if (wifi_lk_step == 0)
 		{
-			USART3_TextFlush();
+			USART3_TextDrain(500);/* keep LINK,DOWN/ACK, bounded */
 			USART3_WaitIdle();
 			wifi_lk_step = 1;
 		}

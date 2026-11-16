@@ -10,6 +10,8 @@
 void CAR_LineFollow(void);
 /* 获取当前运动状态文本(供 UI 数据页显示), buf 至少 12 字节 */
 void CAR_GetState(char *buf);
+/* Print one STATS line (control-loop p50/p99/max, overruns, watchdog). */
+void CAR_PrintStats(void);
 
 /* ==================== 配送任务命令(P0 闭环协议) ==================== */
 typedef enum

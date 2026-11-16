@@ -126,11 +126,15 @@ AIC_MedRobot_stm32f407/
 
 > 每条指令以 `\r\n` 结尾；MCU 侧按行拆分执行，快速按键合并帧也不会丢指令。
 
-**视频帧格式（小车 → 上位机）**
+**视频帧格式（小车 → 上位机，分片包）**
 
 ```
-帧头(0xAA55) + JPEG长度(4B LE) + JPEG数据
+AA 55 A5 5A | total(2B LE) | offset(2B LE) | len(2B LE) | payload(len B) | CRC16(2B LE)
 ```
+
+- `payload` 最大 256B，`CRC16-CCITT` 只覆盖本片数据；上位机按 `offset` 重组整帧。
+- 每个分片之间会优先插入待发送的 `ACK/STATUS/LINK` 文本，控制报文不必等整帧发完。
+- 旧格式 `AA55 + len32 + JPEG + CRC16` 仍保留在 Qt 解析器中，便于回滚或兼容旧固件。
 
 **任务配送命令（上位机 → 小车，P0 闭环协议）**
 
@@ -143,7 +147,11 @@ AIC_MedRobot_stm32f407/
 | `TASK_RESUME,<task_id>` | 恢复任务 |
 | `TASK_CANCEL,<task_id>` | 取消任务回 IDLE |
 
-> 所有任务命令均回 `ACK,<task_id>,<0|1>`；上位机 500ms 未收到 ACK 自动重发（最多 3 次）。
+> 所有任务命令可带可选幂等键 `,seq=<n>`（Qt 上位机自动追加）；车端在 30s 窗口内
+> 对 `cmd+task_id+seq` 相同的重发直接回放上次 ACK（`reason=DUP`），不会因状态机
+> 已推进而误判失败。所有任务命令回 `ACK,<task_id>,<0|1>,<reason>,seq=<n>`；
+> 上位机 500ms 未收到 ACK 自动重发（最多 3 次）。`reason` 取值：
+> `OK / DUP / BUSY / STATE / BADREQ / UNKNOWN`。
 
 **站点表（上下位机一致）**
 
@@ -160,16 +168,17 @@ AIC_MedRobot_stm32f407/
 
 | 报文 | 说明 |
 | --- | --- |
-| `ACK,<task_id>,<0|1>` | 下行命令确认，1=成功 0=拒绝 |
+| `ACK,<task_id>,<0|1>,<reason>,seq=<n>` | 下行命令确认，1=成功 0=拒绝；DUP=重复命令回放 |
 | `ENTER_STATION,<task_id>,<seq>` | 三路全黑横带触发进站（seq=0 取药点 / 1 病房），请求开启识别窗口 |
 | `STATUS,<task_id>,<state>` | state: NAV/APPROACH/STOPPED/WAIT_LOAD/WAIT_UNLOAD/PAUSED/TIMEOUT/CANCELLED |
 | `TASK_ARRIVE,<task_id>,<station_id>` | 已停稳，等待人工确认 |
 | `TASK_DONE,<task_id>` | 卸药确认后任务完成 |
 | `HEARTBEAT,<battery>,<state>` | 每 1s 心跳，上位机据此刷新电量与在线状态 |
 
-> 文本行与视频帧共用一条 TCP 连接：上位机先按 `\r\n` 拆行、命中协议前缀才按文本处理，
-> 其余数据走 AA55 帧解析。车端在视频 DMA 发送期间会丢弃文本以避免破坏帧数据，
-> 由上位机 ACK 重发机制兜底。
+> 文本行与视频分片共用一条 TCP 连接：上位机先按 `\r\n` 拆行、命中协议前缀才按文本处理，
+> 其余数据走 AA55/A55A 分片解析。车端文本队列优先于下一片视频启动，DMA 完成中断也会
+> 立即 pump 文本；因此 ACK 的最坏等待从“整帧 200~400ms”降为“一片约 2.6ms@921600”。
+> 若链路未升到 460800 以上，车端会跳过图传以保住 500ms 的 ACK 预算。
 
 ### 功能详解
 
@@ -198,7 +207,7 @@ AIC_MedRobot_stm32f407/
 
 #### 📦 任务配送（P0 闭环）
 - 状态机：`TASK_IDLE → NAV_TO_LOAD → APPROACH_LOAD → WAIT_LOAD → NAV_TO_WARD → APPROACH_WARD → WAIT_UNLOAD → DONE`
-- 进站触发：左中右三路同时 ≥2000 且连续 10 个采样周期（约 20ms）→ 降速至 PWM 200 → 上报 `ENTER_STATION`
+- 进站触发：左中右三路同时 ≥2000 且连续 4 个控制周期（5ms/次，约 20ms）→ 降速至 PWM 200 → 上报 `ENTER_STATION`
 - 停车：收到目标站点 `STOP` 且校验通过后停车，上报 `TASK_ARRIVE`；2s 内未收到 `STOP` 强制停车（兜底，补发 `TASK_ARRIVE,<task>,<站>,FALLBACK` 并报 `STATUS,TIMEOUT`，上位机弹窗可人工确认）
 - 超时：每段循迹 5 分钟超时中止；装/卸确认 5 分钟超时 LED2 闪烁告警（蜂鸣器 PF8 已被 TIM13 PWM 占用，不可用）
 - 车端触摸确认：控制页「确认装药/确认取药」按钮按下等效 `TASK_CONFIRM`（装药→导航病房，取药→`TASK_DONE` 回 IDLE），WiFi 断链也能现场交接
@@ -231,34 +240,81 @@ AIC_MedRobot_stm32f407/
 
 ### 仍待优化
 
-- **图传帧率仍受限于串口带宽**：已临时提升至 921600，若要更高帧率需进一步压缩 JPEG 尺寸或更换更高带宽链路。
+- **图传帧率仍受限于串口带宽**：已提升至 921600；若要更高帧率需压缩 JPEG、提高链路带宽或改双缓冲采集。
 - **USART2 为历史遗留初始化**（蓝牙/旧版 8266 驱动），当前未被使用，可考虑移除。
 - **心跳电量暂为固定值 100**：待接入电池电压采样后替换 `TASK_BATTERY_DEFAULT`。
 - **站点 ID 暂为编译期常量**：后续可存入 24CXX EEPROM 便于现场配置（注意 PB8/PB9 按键复用约束）。
-- **上行文本报文无完整性校验**：目前仅靠 `\r\n` 分帧，未加序号/CRC（图传帧已有 CRC16）；若要抗误码需扩展协议并同步修改 Qt 上位机解析。
+- **上行文本报文仍无 CRC**：已有 `seq` 幂等键，但文本行本身只靠 `\r\n` 分帧；若要抗误码可加行 CRC 并同步 Qt。
+- **控制环实测数据需台架回填**：本轮在无硬件环境完成 Keil 0 Error/0 Warning 编译，`STATS` 的 p50/p99/max 需上车实测后填入下表。
 
 
 ## 可靠性设计
 
 ### 独立看门狗（IWDG）与任务级健康检查
 
-- `WDG_Init()` 在 `main()` 的 WiFi/摄像头初始化之后启动 IWDG（LSI≈32kHz、32 分频、重载 1600 → 超时约 1.6s），避免初始化耗时被误判为死机。
-- RTOS 模式下控制/WiFi/图传/UI 四个任务各自调用 `WDG_TaskTick()` 上报心跳；控制任务每 200ms 调用 `WDG_CheckAndFeed()`，**只有全部任务心跳都落在 1.2s 窗口内才喂狗**，任一任务挂死即复位自恢复；裸机模式由主循环 `WDG_Feed()` 喂狗。
-- `atk_8266_send_cmd()/atk_8266_send_data()` 的等待循环每次轮询补心跳并喂狗：`AT+CWJAP` 等阻塞式 AT 操作可能持续数秒，属有界等待，不应被判为任务挂死。
+- `WDG_Init()` 现在紧跟 `DWT_Init()`，在 LCD/ADC/USART/摄像头之前启动（LSI≈32kHz、32 分频、重载 1600 → 约 1.6s）。各初始化阶段之间显式 `WDG_Feed()`；`main.c` 不再出现“WiFi 卡死且无看门狗”的窗口。
+- 启动阶段的 AT 等待发生在调度器启动前：`WDG_TaskProgress()` 在 `xTaskGetSchedulerState()!=taskSCHEDULER_RUNNING` 时直接喂狗，保证 30s 有界配网不会触发复位；调度器运行后 AT 等待**只更新 WiFi 任务进度，不直接喂狗**。
+- 看门狗时基独立于 TIM6：RTOS 用 `xTaskGetTickCount()`，裸机用 DWT 毫秒计数。即使 TIM6 中断停止，`now-last` 也不会恒为 0 而“假活”。
+- RTOS 模式下控制/WiFi/图传/UI 四个任务各自调用 `WDG_TaskTick()` 递增 **progress 计数**并记录时间戳；控制任务每 200ms 调用 `WDG_CheckAndFeed()`，只有四个任务的 progress 都前进且 1.2s 内有上报才喂狗。任务“还在跑但业务停滞”也会触发复位，而不是只看任务是否被调度。
+- 诊断：`WDG_GetMissed()` 统计未通过的喂狗检查次数，`STATS` 文本会带出 `wdg=`。
 
-### WiFi 链路自愈（`wifista.c`）
+### WiFi 有界启动与链路自愈（`wifista.c`）
 
-- `WIFI_LinkOnRxLine()` 逐行检测 `CLOSED` / `WIFI DISCONNECT` / `link is not valid` 等掉线标志，进入恢复流程并上报 `LINK,DOWN`。
+- `atk_8266_wifista_config()` 改为 8 步有界状态机：总限时 30s，单步重试上限 5/3 次；AP 不在、密码错、服务器不在都会返回 1，`main()` 打印 `BOOT_TIMEOUT`、显示 `WiFi OFFLINE`，小车继续以离线/手动模式运行，并调用 `WIFI_LinkStartRecovery()` 后台重连。
+- `WIFI_LinkOnRxLine()` 逐行检测 `CLOSED` / `WIFI DISCONNECT` / `link is not valid` 等掉线标志，进入恢复流程并上报 `LINK,DOWN`；同时 `JPEG_TxAbort()` 丢弃半帧，避免新连接从半帧中间继续发。
 - `WIFI_LinkPoll()` 为完全非阻塞的分级恢复状态机：退出透传（`+++` 逃逸，保证前后静默窗口）→ 重开 TCP（`CIPCLOSE` + `CIPSTART`，重试 8 次）→ 重连 AP（`CWJAP`，重试 5 次）→ 重进透传（`CIPMODE=1` + `CIPSEND`）；各级均失败则指数退避（1s→30s），4 轮后 `AT+RST` 复位模块再来一轮。
 - 恢复期间 `WIFI_IsReconnecting()` 为真，图传任务暂停推流，避免 AT 指令与 JPEG 帧争用 USART3；恢复成功上报 `LINK,UP`。
 - 遥测接口：`WIFI_GetLinkState()`、`WIFI_GetReconnectCount()`。
 
 ### USART3 文本发送队列（`usart3.c` / `wifi_transfer.c`）
 
-- 原 `u3_printf()` 用 `vsprintf` 写 400B 固定缓冲（无边界检查）、逐字节 `while(TC==RESET)` 忙等，且图传 DMA 忙时直接丢报文。现改为：`vsnprintf` 有界格式化（192B）→ 768B 环形队列 → 128B 分块 DMA 发送；DMA 一旦空闲即继续排空（控制任务每 2ms 与 DMA 完成中断都会 pump）。
-- `USART3_DMA_TryStart()` 在关中断临界区内完成“判忙 + 启动”，文本队列与图传帧共用 DMA1_Stream3 时不会互相插入；图传启动失败时保留帧数据、下次调用重试，不再丢帧。
-- `USART3_SendEscape()` 仅在队列为空且链路空闲时发出孤立的 `+++`，保证逃逸序列前后静默；`USART3_WaitIdle()` 设 200ms 上限，不会挂死调用者。
-- 队列满时丢弃并累加计数（`USART3_TextOverflow()`），行为可观测，不再无声出错。
+- 原 `u3_printf()` 用 `vsprintf` 写 400B 固定缓冲（无边界检查）、逐字节 `while(TC==RESET)` 忙等，且图传 DMA 忙时直接丢报文。现改为：`vsnprintf` 有界格式化（192B）→ 768B 环形队列 → 128B 分块 DMA 发送；控制任务每 5ms、DMA 完成中断和每个视频分片结束都会 pump。
+- `USART3_DMA_TryStart()` 在关中断临界区内完成“判忙 + 启动”，文本队列与图传分片共用 DMA1_Stream3 时不会互相插入。
+- 图传改为 256B 分片包（`AA55A55A` + total/offset/len + CRC16）：文本队列非空时**不启动下一片**，因此 ACK 最坏等待约 2.6ms@921600；链路低于 460800 时直接跳过图传，优先保证控制。
+- `USART3_SendEscape()` 仅在队列为空且链路空闲时发出孤立的 `+++`；进入恢复前用 `USART3_TextDrain(500)` 有界排空，`LINK,DOWN`/最后一条 ACK 不再被 `TextFlush` 丢弃。
+- 队列满时丢弃并累加计数（`USART3_TextOverflow()`），`STATS` 中可见 `txov=`，不再无声出错。
+
+### USART3 接收：DMA circular + IDLE + 环形缓冲
+
+- RX 不再使用“每字节一次 RXNE 中断 + 400B 单缓冲”。`DMA1_Stream1` 以 circular 模式写入 512B 环形缓冲，USART IDLE 中断和 DMA HT/TC 中断把新增字节搬入现有 `USART3_RX_BUF`；TIM7 的 100ms 帧间隔仍负责置 `USART3_RX_STA[15]`，所有 AT 层调用点无需改写。
+- `USART3_RxReset()` 在清帧的同时把 DMA 读指针同步到当前写指针，避免把上一帧的残留字节带入下一帧。
+- 新增可观测计数：`USART3_GetRxOverflow()`（帧缓冲满丢弃字节）、`USART3_GetRxOre()`（ORE/DMA 传输错误）。921600 下不再依赖 CPU 逐字节搬运。
+- 注意：读取 IDLE 需读 SR 再读 DR，极端情况下可能与 DMA 争一个字节；这是 STM32 USART+DMA 的已知取舍，已通过环形缓冲与 CRC/长度校验兜底。
+
+### 控制环时序与抖动统计（`STATS`）
+
+原控制环并非 2ms：`Get_Adc_Average()` 每路 `delay_ms(5)`（3 路×2 次≈30ms）、HC-SR04 最坏阻塞 60ms、`MOTOR_LineTurnLeft/Right()` 每次阻塞 20ms。现改为：
+
+| 环节 | 旧实现 | 现实现 |
+| --- | --- | --- |
+| 循迹 ADC | 软件启动 + 5ms 延时平均 | TIM2 TRGO 1kHz 触发 ADC3 扫描 + DMA2_Stream0 circular，HT/TC 各平均 4 帧，读取零阻塞 |
+| 超声波 | 阻塞等回波，最坏 60ms | PF2 触发 + PF3 EXTI 双边沿 + DWT 时间戳，`HC_SR04_Poll()` 非阻塞，45ms 超时 |
+| 转向 | `MOTOR_LineTurnLeft/Right()` 内 `delay_ms(20)` | `CAR_StepSteer()` 比例差速 + `MOTOR_ForwardDual()`，无延时 |
+| 丢线搜索 | 原地阻塞转向 | `CAR_StepSearch()` pivot/settle 相位交替，状态机推进 |
+| 控制周期 | `vTaskDelayUntil(2ms)` 但常被阻塞拉长到几十 ms | `vTaskDelayUntil(5ms)`，单次循环只做非阻塞步骤 |
+
+DWT 统计在每次控制循环记录 `dt`（相邻循环起点差）和 `work`（循环体耗时），保留最近 128 次；上位机或串口发送 `STATS\r\n` 即返回：
+
+```
+STATS,dt50=<us>,dt99=<us>,dtmax=<us>,w50=<us>,w99=<us>,wmax=<us>,ovr=<n>,n=<cycles>,wdg=<n>,txov=<n>
+STATS2,vid_drop=<n>,rxov=<n>,ore=<n>
+```
+
+| 指标 | 采集方式 | 设计/验收基线 | 台架实测 |
+| --- | --- | --- | --- |
+| 控制周期 p50 | `STATS` `dt50` | ≈5000µs | 待回填 |
+| 控制周期 p99 | `STATS` `dt99` | ≤5500µs | 待回填 |
+| 控制周期 max | `STATS` `dtmax` | ≤8000µs | 待回填 |
+| 循环体 p99 | `STATS` `w99` | ≤2000µs | 待回填 |
+| 7ms 周期超时次数 | `STATS` `ovr` | 持续运行 10min 为 0 | 待回填 |
+
+> 本轮在无硬件环境完成编译验证；上表“实测”列需在台架运行 `STATS` 后回填，避免写入未测量的数据。
+
+### 协议幂等与 ACK 原因码
+
+- 上位机每条 `TASK_*/STOP` 命令自动追加 `,seq=<n>`；车端缓存最后一次 `cmd+task_id+seq` 的结果 30s。
+- 重发命中缓存时直接回放 `ACK,...,DUP,seq=<n>`，不再因 `TASK_START` 已进入 `NAV_TO_LOAD` 而回 `ACK,0` 被上位机标成“下发失败”。
+- 首次执行成功回 `OK`，非法字段回 `BADREQ`，任务忙回 `BUSY`，状态不允许回 `STATE`，未知命令回 `UNKNOWN`；Qt 日志会显示原因码。
 
 ### 任务状态机加固（`car_app.c` / `wifi_cmd.c`）
 
@@ -321,9 +377,9 @@ FreeRTOS 内核源码（仅构建所需文件）位于 `RTOS\FreeRTOS-Kernel\`�
 
 | 任务 | 函数 | 优先级 | 周期 | 栈(字) | 职责 |
 | --- | --- | --- | --- | --- | --- |
-| 主控任务 | `vTaskCarControl`（main.c） | 4（最高） | 2ms | 512 | 摄像头任务+遮挡检测、超声波测距+避障、ADC 采样、WiFi 命令执行、循迹/运动控制 |
+| 主控任务 | `vTaskCarControl`（main.c） | 4（最高） | 5ms | 512 | 摄像头任务+遮挡检测、超声波测距+避障、ADC 采样、WiFi 命令执行、循迹/运动控制 |
 | WiFi 命令任务 | `vTaskWifi`（rtos_app.c） | 3 | 10ms | 256 | 轮询 USART3 接收状态，把原始命令字符串拷贝入队 |
-| JPEG 图传任务 | `vTaskJpeg`（rtos_app.c） | 3 | 5ms | 256 | JPEG 帧加头/CRC 并通过 DMA 发送，发送完重启 DCMI 采集 |
+| JPEG 图传任务 | `vTaskJpeg`（rtos_app.c） | 3 | 5ms | 256 | 每次发送一个 256B 视频分片（带 total/offset/CRC），发完重启 DCMI |
 | UI 任务 | `vTaskUi`（rtos_app.c） | 1（最低） | 20ms | 384 | 触摸扫描、界面刷新、图像参数调节 |
 | 空闲任务 | 系统自带 | 0 | - | 128 | 内核空闲任务 |
 
@@ -357,10 +413,10 @@ CAR_StepMotion ->  避障/遮挡/遥控暂停 -> 起步加速 -> 循迹逻辑
 ```
 
 - 裸机模式：`CAR_LineFollow()` 按原顺序调用全部步骤，行为与原来一致。
-- RTOS 模式：`vTaskCarControl` 以 2ms 周期调用除 UI/JPEG 外的步骤；
+- RTOS 模式：`vTaskCarControl` 以 5ms 周期调用除 UI/JPEG 外的步骤；
   UI、JPEG、WiFi 由各自任务并行执行。
-- 所有原有驱动接口（`MOTOR_*`、`CAMERA_*`、`UI_*`、`HC_SR04_*`、
-  `atk_8266_*`、`jpeg_*`、`ADC_*`）均被原样复用，未修改其内部实现。
+- 驱动接口保留原名称；ADC 改为 `Adc_ReadLine()`、超声波改为 `HC_SR04_Start/Poll()`、
+  控制环改用 `CAR_StepSteer/Search()`，其余调用点保持兼容。
 
 ---
 
