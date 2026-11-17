@@ -1,625 +1,341 @@
-﻿# AIC_MedRobot_stm32f407 — STM32F407 药品配送小车固件
+﻿# STM32F407 药品配送车固件
 
-## FreeRTOS 支持
+车端固件运行于 STM32F407ZGT6，负责三路循迹、超声波避障、OV2640 JPEG 图传、
+触摸屏交互和药品配送任务状态机。固件通过 ESP8266 与 Qt 上位机建立 TCP 连接，
+支持 FreeRTOS 与裸机两种运行模式。
 
-本项目已移植 FreeRTOS（内核 V11.1.0），采用条件编译，可在 RTOS 与裸机模式间一键切换：
+## 功能
 
-- 总开关：`RTOS\rtos_conf.h` 中的 `RTOS_ENABLE`（1 = RTOS，0 = 裸机）
-- 详细设计（任务划分、延时改造、中断向量、内存预算等）：见下文
-  [「FreeRTOS 移植设计」](#freertos-移植设计)
+- 三路模拟循迹：ADC3 扫描 PF7/PF6/PF5，TIM2 触发、DMA 循环采样。
+- 运动控制：左右轮独立 PWM、比例差速循迹、丢线搜索与遥控覆盖。
+- 超声波避障：HC-SR04 双边沿捕获，距离小于 25 cm 停车，大于 28 cm 恢复。
+- JPEG 图传：OV2640 QVGA，DCMI + DMA 采集，USART3 分片发送。
+- 触摸屏 UI：控制、数据、网络三页，支持车端装药/取药确认。
+- 任务配送：进站检测、目标站点停车、装/卸确认、超时与兜底处理。
+- 可靠性：IWDG、任务级心跳、幂等协议、文本发送队列、接收 DMA 环形缓冲。
 
-## 项目简介
+## 硬件平台
 
-本项目是基于 **STM32F407** (Cortex-M4) 的嵌入式固件工程，作为 **AIC 药品配送机器人系统** 的下位机端运行。它集成了 **WiFi 遥控、JPEG 实时图传、黑线循迹、超声波避障、任务配送（P0）闭环** 等功能：上位机通过 TCP 下发任务并识别站点二维码，小车循迹进站、停车交接、触摸确认，全链路闭环（上位机 `AICMedicineRobotSystem` 内置 quirc 识别模块）。
+| 项目 | 内容 |
+| --- | --- |
+| MCU | STM32F407ZGT6，Cortex-M4F，168 MHz，1 MB Flash |
+| 摄像头 | OV2640，DCMI 8 位并行 + SCCB，JPEG QVGA 320×240 |
+| WiFi | ATK-ESP8266，USART3 AT 指令与 TCP 透传 |
+| 显示 | TFT-LCD，FSMC 接口，电容触摸 |
+| 电机 | 2× 直流电机，TIM13/TIM14 PWM，GPIO 方向控制 |
+| 循迹 | 3× 模拟循迹传感器，ADC3 |
+| 测距 | HC-SR04，GPIO 触发 + EXTI 回波 |
+| 调试 | J-Link / ST-Link，SWD |
 
-## 开发环境
+## 引脚与资源
 
-| 项目         | 内容                          |
-| ------------ | ----------------------------- |
-| **MCU**      | STM32F407ZGT6 (Cortex-M4)     |
-| **IDE**      | Keil MDK v5 (µVision)         |
-| **固件库**   | STM32F4xx 标准外设库 (StdPeriph) |
-| **调试器**   | J-Link / ST-Link              |
-| **RTOS**     | FreeRTOS V11.1.0（可选，条件编译） |
+| 功能 | 引脚 | 说明 |
+| --- | --- | --- |
+| 循迹左 | PF7 | ADC3_IN5 |
+| 循迹中 | PF6 | ADC3_IN4 |
+| 循迹右 | PF5 | ADC3_IN15 |
+| 左电机 PWM | PF8 | TIM13_CH1 |
+| 右电机 PWM | PF9 | TIM14_CH1 |
+| 左电机方向 | PC2 / PC3 | 方向与调速 |
+| 右电机方向 | PC4 / PC5 | 方向与调速 |
+| 超声波 TRIG | PF2 | 推挽输出 |
+| 超声波 ECHO | PF3 | 双边沿 EXTI |
+| USART3 TX / RX | PB10 / PB11 | 连接 ESP8266 |
+| 状态指示灯 | PF10 | LED2 |
+| 按键 | PB8 / PB9 | KEY1 / KEY0 |
+| 摄像头 | DCMI + SCCB | 8 位并行数据 |
+| 触摸屏 | FSMC | 显示与触摸 |
+
+### 资源复用约束
+
+- **PF9** 由 TIM14_CH1 右电机 PWM 占用，LED1 不可用；状态指示统一使用 PF10（LED2）。
+- **PF8** 由 TIM13_CH1 左电机 PWM 占用，蜂鸣器不可用；告警使用 LED2。
+- **PB8/PB9** 为按键 EXTI 输入。24CXX 软件 IIC 仅在电阻屏校准分支初始化；
+  当前使用电容屏，不启用 24CXX。
+
+循迹 ADC 通道依据 STM32F407 官方引脚复用表定义：左 PF7(ADC3_CH5)、
+中 PF6(ADC3_CH4)、右 PF5(ADC3_CH15)，与 ADC3 扫描顺序一致。
 
 ## 目录结构
 
-```
+```text
 AIC_MedRobot_stm32f407/
-├── CORE/              # Cortex-M4 内核文件 & 启动文件
+├── CORE/              # Cortex-M4 内核文件与启动文件
 ├── FWLIB/             # STM32F4 标准外设库
-├── HARDWARE/          # 外设驱动模块（按功能拆分）
-│   ├── 24CXX/         # EEPROM (AT24Cxx) 驱动
-│   ├── ADC/           # ADC 初始化与采样
-│   ├── ATK-ESP8266/   # ESP8266 WiFi 模块 AT 指令驱动
-│   ├── BEEP/          # 蜂鸣器驱动
-│   ├── CAMERA/        # 摄像头高层任务调度
-│   ├── DCMI/          # DCMI 接口 (数字摄像头) 驱动
-│   ├── EXTI/          # 外部中断 & 毫秒级时间戳
-│   ├── GBK_LibDrive/  # GBK 字库驱动
-│   ├── IIC/           # 软件 IIC 驱动
-│   ├── KEY/           # 按键驱动
-│   ├── LCD/           # TFT-LCD 显示屏驱动
-│   ├── LED/           # LED 指示灯驱动
-│   ├── MOTOR/         # 直流电机驱动（含循迹/避障运动控制）
-│   ├── OV2640/        # OV2640 摄像头传感器配置
-│   ├── PWM/           # PWM 输出驱动
-│   ├── SPI/           # SPI 总线驱动
-│   ├── TIMER/         # 定时器驱动
-│   ├── TOUCH/         # 电容触摸屏驱动
-│   ├── UI/            # 图形用户界面（3 页面：控制/数据/网络）
-│   ├── USART2/        # USART2 (预留，未使用)
-│   ├── USART3/        # USART3 (ESP8266 AT + 图传)
-│   ├── W25QXX/        # SPI Flash (W25Qxx) 驱动
-│   └── WIFI_TRANSFER/ # WiFi 数据透传模块
-├── OBJ/               # 编译产物
-├── SYSTEM/            # 基础支持模块 (delay/sys/usart)
-└── USER/              # 用户代码 & 工程配置
-    ├── main.c         # 主程序入口（硬件初始化 + 模式分支）
-    ├── car_app.c      # 小车应用层（7 个步骤函数 + 主循环 + RTOS 主控任务）
-    ├── wifi_cmd.c     # WiFi 命令解析与执行（startTask/stopTask 等）
-    ├── AIC_MedRobot.uvproj      # Keil 工程文件
-    └── ...
+├── HARDWARE/          # 外设驱动
+│   ├── ADC/           # 三路循迹采样
+│   ├── ATK-ESP8266/   # WiFi AT 指令与链路管理
+│   ├── CAMERA/        # 摄像头与遮挡检测
+│   ├── DCMI/          # 数字摄像头接口
+│   ├── MOTOR/         # 电机与运动控制
+│   ├── TIMER/         # 定时器与超声波捕获
+│   ├── UI/            # 触摸屏界面
+│   ├── USART3/        # WiFi 串口、文本队列与 DMA 接收
+│   └── WIFI_TRANSFER/ # JPEG 分片图传
+├── RTOS/              # FreeRTOS 内核、配置与任务层
+├── SYSTEM/            # delay/sys/usart 等基础支持
+└── USER/
+    ├── main.c         # 初始化、裸机循环与 RTOS 控制任务
+    ├── car_app.c      # 控制逻辑、任务状态机与协议处理
+    ├── wifi_cmd.c     # WiFi 命令解析
+    └── AIC_MedRobot.uvproj
 ```
-
-## 硬件接线
-
-| 外设            | 接口      | 说明                         |
-| --------------- | --------- | ---------------------------- |
-| **OV2640 摄像头** | DCMI + SCCB | 8 位并行数据，JPEG 输出      |
-| **ESP8266 WiFi** | USART3    | AT 指令控制 + 透传（配网 115200，图传 921600） |
-| **WiFi 图传**    | USART3    | DMA 发送 JPEG（图传临时提速至 921600） |
-| **USART2**       | USART2    | 预留（历史遗留，当前未使用） |
-| **TFT-LCD**      | FSMC      | 显示与触摸交互               |
-| **电机驱动**     | TIM PWM   | 方向 + 速度控制              |
-| **HC-SR04 超声波** | GPIO + TIM | 测距避障                    |
-| **ADC 循迹**     | ADC3      | 3 路模拟输入 (左=PF7/中=PF6/右=PF5) |
 
 ## 软件架构
 
-### 主循环 (`CAR_LineFollow`)
+### 运行模式
 
-默认采用裸机前后台架构，`main()` 初始化后进入 `CAR_LineFollow()` 大循环；`RTOS_ENABLE=1` 时同一套步骤函数由 FreeRTOS 任务调度（见「FreeRTOS 移植设计」）：
+`RTOS/rtos_conf.h` 中的 `RTOS_ENABLE` 选择运行模式：
 
-```
-┌─────────────────────────────┐
-│  WiFi 命令检查 (ESP8266)    │
-├─────────────────────────────┤
-│  JPEG 帧发送 (USART3 DMA)   │
-├─────────────────────────────┤
-│  UI 任务 (触摸/显示)        │
-├─────────────────────────────┤
-│  摄像头遮挡检测              │
-├─────────────────────────────┤
-│  超声波测距 & 避障          │
-├─────────────────────────────┤
-│  ADC 循迹传感器采样          │
-├─────────────────────────────┤
-│  运动控制 (循迹/方向记忆)    │
-└─────────────────────────────┘
+```c
+#define RTOS_ENABLE  1   /* 1 = FreeRTOS，0 = 裸机大循环 */
 ```
 
-### 控制优先级 (从高到低)
+两种模式共用同一套初始化代码和步骤函数。RTOS 模式下，控制任务以 5 ms 周期执行；
+裸机模式下由 `CAR_LineFollow()` 顺序调用相同步骤。
 
-1. **摄像头遮挡** — 遮挡立即停车保护
-2. **超声波避障** — 距离 < 25cm 停车，> 28cm 恢复
-3. **WiFi 遥控覆盖** — 收到遥控指令后 500ms 内优先响应
-4. **黑线循迹** — 默认运动模式
+### 任务划分
 
-### TCP 通信协议
+| 任务 | 函数 | 优先级 | 周期 | 栈 | 职责 |
+| --- | --- | ---: | ---: | ---: | --- |
+| 控制任务 | `vTaskCarControl` | 4 | 5 ms | 2 KB | 采样、避障、循迹、任务状态机、电机 |
+| WiFi 任务 | `vTaskWifi` | 3 | 10 ms | 1 KB | 读取 USART3 命令并入队 |
+| 图传任务 | `vTaskJpeg` | 3 | 5 ms | 1 KB | 发送视频分片、维护 DCMI |
+| UI 任务 | `vTaskUi` | 1 | 20 ms | 1.5 KB | 触摸扫描与页面刷新 |
+| 空闲任务 | 内核 | 0 | - | 0.5 KB | 系统空闲 |
 
-与上位机（`AICMedicineRobotSystem`）共用端口 **8086**：
+设计约束：
 
-**指令格式（上位机 → 小车）**
+- 电机只由控制任务驱动，WiFi 任务只负责接收和入队，避免并发写 PWM/GPIO。
+- 图传与 WiFi 任务同优先级，时间片轮转；图传由 DMA 发送，轮询开销小。
+- UI 任务优先级最低，LCD 刷新不会阻塞运动控制。
 
-| 指令         | 说明                 |
-| ------------ | -------------------- |
-| `forWard`    | 前进                 |
-| `backWard`   | 后退                 |
-| `lefTurn`    | 左转                 |
-| `righTurn`   | 右转                 |
-| `letStop`    | 停止                 |
-| `speedUp`    | 加速 (+50 PWM)       |
-| `speedDown`  | 减速 (-50 PWM)       |
-| `startTask`  | 使能循迹（上位机"添加配送任务/呼叫小车/返回充电"时发送） |
-| `stopTask`   | 停止循迹并刹停（上位机"暂停/取消/手动控制"时发送） |
+### 控制优先级
 
-> 每条指令以 `\r\n` 结尾；MCU 侧按行拆分执行，快速按键合并帧也不会丢指令。
+1. 摄像头遮挡：立即停车。
+2. 超声波避障：小于 25 cm 停车，大于 28 cm 恢复。
+3. WiFi 遥控覆盖：收到遥控命令后 500 ms 内优先执行。
+4. 黑线循迹：默认运动模式。
 
-**视频帧格式（小车 → 上位机，分片包）**
+### 控制环
 
-```
-AA 55 A5 5A | total(2B LE) | offset(2B LE) | len(2B LE) | payload(len B) | CRC16(2B LE)
-```
+- ADC3 由 TIM2 TRGO 以 1 kHz 触发，DMA2 Stream0 循环搬运三路采样；控制任务
+  每 5 ms 读取一次平均值。
+- HC-SR04 使用 PF2 触发、PF3 双边沿 EXTI 与 DWT 时间戳，`HC_SR04_Poll()`
+  非阻塞，超时 45 ms。
+- 循迹采用比例差速；全白时按上次转向执行 pivot/settle 搜索状态机。
+- `STATS` 输出控制周期与循环体耗时分位数：
 
-- `payload` 最大 256B，`CRC16-CCITT` 只覆盖本片数据；上位机按 `offset` 重组整帧。
-- 每个分片之间会优先插入待发送的 `ACK/STATUS/LINK` 文本，控制报文不必等整帧发完。
-- 旧格式 `AA55 + len32 + JPEG + CRC16` 仍保留在 Qt 解析器中，便于回滚或兼容旧固件。
-
-**任务配送命令（上位机 → 小车，P0 闭环协议）**
-
-| 指令 | 说明 |
-| --- | --- |
-| `TASK_START,<task_id>,<from>,<to>` | 下发任务，如 `TASK_START,T-2025,S1,S3` |
-| `STOP,<task_id>,<station_id>` | 上位机识别到目标站点后要求停车 |
-| `TASK_CONFIRM,<task_id>,<load\|unload>,<user>` | 装/卸药人工确认 |
-| `TASK_PAUSE,<task_id>` | 暂停任务 |
-| `TASK_RESUME,<task_id>` | 恢复任务 |
-| `TASK_CANCEL,<task_id>` | 取消任务回 IDLE |
-
-> 所有任务命令可带可选幂等键 `,seq=<n>`（Qt 上位机自动追加）；车端在 30s 窗口内
-> 对 `cmd+task_id+seq` 相同的重发直接回放上次 ACK（`reason=DUP`），不会因状态机
-> 已推进而误判失败。所有任务命令回 `ACK,<task_id>,<0|1>,<reason>,seq=<n>`；
-> 上位机 500ms 未收到 ACK 自动重发（最多 3 次）。`reason` 取值：
-> `OK / DUP / BUSY / STATE / BADREQ / UNKNOWN`。
-
-**站点表（上下位机一致）**
-
-| 站点ID | 名称 |
-| --- | --- |
-| S1 | 药房01 |
-| S2 | 病房001 |
-| S3 | 病房002 |
-| S4 | 车库01 |
-
-> 与上位机任务录入弹窗的下拉项一一对应；先以编译期常量维护，后续可存入 24CXX EEPROM。
-
-**任务状态上报（小车 → 上位机，文本行，`\r\n` 结尾）**
-
-| 报文 | 说明 |
-| --- | --- |
-| `ACK,<task_id>,<0|1>,<reason>,seq=<n>` | 下行命令确认，1=成功 0=拒绝；DUP=重复命令回放 |
-| `ENTER_STATION,<task_id>,<seq>` | 三路全黑横带触发进站（seq=0 取药点 / 1 病房），请求开启识别窗口 |
-| `STATUS,<task_id>,<state>` | state: NAV/APPROACH/STOPPED/WAIT_LOAD/WAIT_UNLOAD/PAUSED/TIMEOUT/CANCELLED |
-| `TASK_ARRIVE,<task_id>,<station_id>` | 已停稳，等待人工确认 |
-| `TASK_DONE,<task_id>` | 卸药确认后任务完成 |
-| `HEARTBEAT,<battery>,<state>` | 每 1s 心跳，上位机据此刷新电量与在线状态 |
-
-> 文本行与视频分片共用一条 TCP 连接：上位机先按 `\r\n` 拆行、命中协议前缀才按文本处理，
-> 其余数据走 AA55/A55A 分片解析。车端文本队列优先于下一片视频启动，DMA 完成中断也会
-> 立即 pump 文本；因此 ACK 的最坏等待从“整帧 200~400ms”降为“一片约 2.6ms@921600”。
-> 若链路未升到 460800 以上，车端会跳过图传以保住 500ms 的 ACK 预算。
-
-### 功能详解
-
-#### 🚗 黑线循迹
-- 3 路 ADC 检测地面黑线，阈值 2000
-- 中路黑线直行，左转/右转根据两侧偏差
-- 全白时按上次转向方向搜索
-
-#### 📷 JPEG 图传
-- OV2640 配置为 JPEG 输出 (QVGA 320×240)
-- DCMI + DMA 双缓冲采集，USART3 DMA 发送
-
-#### 📡 WiFi 遥控
-- ESP8266 AT 指令接收，匹配预定义指令
-
-#### 🛑 超声波避障
-- HC-SR04 周期测距 (50ms)，可 UI 开关
-
-#### 🖥️ 触摸屏 UI
-- 3 页面：控制 / 数据 / 网络
-- 实时距离、避障状态显示
-- 网络页面显示当前网络配置：WiFi 名称、本机 IP、服务器 IP/端口、在线状态
-- 数据页（调试）显示三路循迹 ADC 原始值（L/M/R）与运动状态/速度（ST/PWM）
-- 控制页装卸确认按钮：原方向键区域改为「确认装药/确认取药」触摸按钮，任务等待装/卸确认时按钮高亮，按下即完成确认（等效 `TASK_CONFIRM`，不依赖上位机）
-- 字库（`ui_zh_font.c`）为 16×16 中文点阵，本轮新增 确/认/装/取 四字
-
-#### 📦 任务配送（P0 闭环）
-- 状态机：`TASK_IDLE → NAV_TO_LOAD → APPROACH_LOAD → WAIT_LOAD → NAV_TO_WARD → APPROACH_WARD → WAIT_UNLOAD → DONE`
-- 进站触发：左中右三路同时 ≥2000 且连续 4 个控制周期（5ms/次，约 20ms）→ 降速至 PWM 200 → 上报 `ENTER_STATION`
-- 停车：收到目标站点 `STOP` 且校验通过后停车，上报 `TASK_ARRIVE`；2s 内未收到 `STOP` 强制停车（兜底，补发 `TASK_ARRIVE,<task>,<站>,FALLBACK` 并报 `STATUS,TIMEOUT`，上位机弹窗可人工确认）
-- 超时：每段循迹 5 分钟超时中止；装/卸确认 5 分钟超时 LED2 闪烁告警（蜂鸣器 PF8 已被 TIM13 PWM 占用，不可用）
-- 车端触摸确认：控制页「确认装药/确认取药」按钮按下等效 `TASK_CONFIRM`（装药→导航病房，取药→`TASK_DONE` 回 IDLE），WiFi 断链也能现场交接
-- 心跳：每 1s 上报电量与任务状态（电量暂为固定值 100，预留电池采样扩展）
-- 职责划分：上位机「看和管」——二维码识别、任务队列、确认弹窗、日志；车端「跑和停」——循迹导航、进站降速、停车兜底、触摸确认
-- 二维码进站识别（上位机 quirc，ISC 许可）：收到 `ENTER_STATION` 开启 2s 识别窗口，对 JPEG 帧灰度解码（M3 已落地，待实车联调）；窗口超时静默重开一轮，两轮未命中提示「站点未确认」，依赖车端兜底停车后人工确认
-- 二维码规格：内容为 `S1~S4` 站点 ID 加至多 1 字节校验位，上位机按「站点前缀 + 校验位」匹配（兼容无校验位贴纸）；识别区 20~30cm 长，命中目标站点即发 `STOP`，非目标站点只记日志不动作
-- 遥控覆盖：遥控指令（`forWard` 等）触发 500ms 电机覆盖，任务状态机保持挂起，覆盖结束后自动恢复循迹
-
-## 已知问题与注意事项
-
-### 硬件资源占用说明（已核对）
-
-- **PF9（LED1/D1）由 TIM14 右电机 PWM 独占**：`LED_Init()` 已不再配置 PF9，指示灯统一使用 PF10（LED2/D2）；D1 因引脚被 PWM 占用在硬件上不可用，`led.h` 中 `LED1` 宏仅作引脚记录，请勿使用。
-- **PF8（蜂鸣器）由 TIM13 左电机 PWM 独占**：`beep.h` 的 `BEEP` 宏在电机启用后不可用（引脚被定时器复用），任务确认超时告警改用 LED2 闪烁。
-- **PB8/PB9 为按键 EXTI 输入**：KEY1(PB8)/KEY0(PB9) 下降沿触发（`EXTIX_Init`）；24CXX 软件 IIC（`AT24CXX_Init`）仅在 `TP_Init()` 电阻屏分支初始化。本工程使用电容屏（GT9147/OTT2001A），不初始化 24CXX，无实际冲突；若后续改用电阻屏，需重新评估按键与校准存储的引脚复用。
-
-> 循迹 ADC 通道核对（依据 STM32F407 官方 CubeMX 数据库）：左=PF7(ADC3_CH5)、
-> 中=PF6(ADC3_CH4)、右=PF5(ADC3_CH15)，与 `adc.c`/`car_app.c` 代码一致；
-> PC5 是 ADC1/ADC2 的 IN15，与 ADC3 无关，不存在 PC5 复用冲突。
-
-### 已修复/优化的软件问题
-
-- **JPEG 图传改为非阻塞 DMA 发送**：原 `USART3_Send_DMA_Start()` 会忙等整帧发送完成（115200 波特率下约 0.5~1s），期间超声波避障/电机控制被冻结。现由 DMA 中断置完成标志，主循环空闲时再重新挂载 DCMI，保障避障实时性。
-- **`MOTOR_Stop()` 移除 100ms 阻塞延时**：障碍/遮挡触发停车时立即响应，不再阻塞主循环。
-- **USART2 中断优先级越界修正**：`NVIC_PriorityGroup_2` 下抢占优先级范围 0~3，原配置 4/5 被静默截断为最高优先级，已改为 3/2。
-- **JPEG 帧缓冲越界防护**：帧头/CRC 写入与 `memmove` 增加边界检查，防止 JPEG 填满缓冲时越界写。
-- **JPEG 模式下摄像头遮挡检测**：JPEG 模式时 `camera_frame`（RGB565 预览缓冲）不再更新，原遮挡检测基于陈旧数据。现增加基于 JPEG 帧大小的遮挡启发式检测（阈值 `JPEG_OCCLUSION_SIZE_THRESHOLD`，按实际场景调整），并停止刷新陈旧的预览画面。
-- **`LED_Init()` 不再配置 PF9**：PF9 已由 TIM14 右电机 PWM（TIM14_CH1）独占，LED1(D1) 硬件上不可用；现仅初始化 PF10（LED2），消除 LED 初始化对 PWM 引脚的潜在覆写。
-
-### 仍待优化
-
-- **图传帧率仍受限于串口带宽**：已提升至 921600；若要更高帧率需压缩 JPEG、提高链路带宽或改双缓冲采集。
-- **USART2 为历史遗留初始化**（蓝牙/旧版 8266 驱动），当前未被使用，可考虑移除。
-- **心跳电量暂为固定值 100**：待接入电池电压采样后替换 `TASK_BATTERY_DEFAULT`。
-- **站点 ID 暂为编译期常量**：后续可存入 24CXX EEPROM 便于现场配置（注意 PB8/PB9 按键复用约束）。
-- **上行文本报文仍无 CRC**：已有 `seq` 幂等键，但文本行本身只靠 `\r\n` 分帧；若要抗误码可加行 CRC 并同步 Qt。
-- **控制环实测数据需台架回填**：本轮在无硬件环境完成 Keil 0 Error/0 Warning 编译，`STATS` 的 p50/p99/max 需上车实测后填入下表。
-
-
-## 可靠性设计
-
-### 独立看门狗（IWDG）与任务级健康检查
-
-- `WDG_Init()` 现在紧跟 `DWT_Init()`，在 LCD/ADC/USART/摄像头之前启动（LSI≈32kHz、32 分频、重载 1600 → 约 1.6s）。各初始化阶段之间显式 `WDG_Feed()`；`main.c` 不再出现“WiFi 卡死且无看门狗”的窗口。
-- 启动阶段的 AT 等待发生在调度器启动前：`WDG_TaskProgress()` 在 `xTaskGetSchedulerState()!=taskSCHEDULER_RUNNING` 时直接喂狗，保证 30s 有界配网不会触发复位；调度器运行后 AT 等待**只更新 WiFi 任务进度，不直接喂狗**。
-- 看门狗时基独立于 TIM6：RTOS 用 `xTaskGetTickCount()`，裸机用 DWT 毫秒计数。即使 TIM6 中断停止，`now-last` 也不会恒为 0 而“假活”。
-- RTOS 模式下控制/WiFi/图传/UI 四个任务各自调用 `WDG_TaskTick()` 递增 **progress 计数**并记录时间戳；控制任务每 200ms 调用 `WDG_CheckAndFeed()`，只有四个任务的 progress 都前进且 1.2s 内有上报才喂狗。任务“还在跑但业务停滞”也会触发复位，而不是只看任务是否被调度。
-- 诊断：`WDG_GetMissed()` 统计未通过的喂狗检查次数，`STATS` 文本会带出 `wdg=`。
-
-### WiFi 有界启动与链路自愈（`wifista.c`）
-
-- `atk_8266_wifista_config()` 改为 8 步有界状态机：总限时 30s，单步重试上限 5/3 次；AP 不在、密码错、服务器不在都会返回 1，`main()` 打印 `BOOT_TIMEOUT`、显示 `WiFi OFFLINE`，小车继续以离线/手动模式运行，并调用 `WIFI_LinkStartRecovery()` 后台重连。
-- `WIFI_LinkOnRxLine()` 逐行检测 `CLOSED` / `WIFI DISCONNECT` / `link is not valid` 等掉线标志，进入恢复流程并上报 `LINK,DOWN`；同时 `JPEG_TxAbort()` 丢弃半帧，避免新连接从半帧中间继续发。
-- `WIFI_LinkPoll()` 为完全非阻塞的分级恢复状态机：退出透传（`+++` 逃逸，保证前后静默窗口）→ 重开 TCP（`CIPCLOSE` + `CIPSTART`，重试 8 次）→ 重连 AP（`CWJAP`，重试 5 次）→ 重进透传（`CIPMODE=1` + `CIPSEND`）；各级均失败则指数退避（1s→30s），4 轮后 `AT+RST` 复位模块再来一轮。
-- 恢复期间 `WIFI_IsReconnecting()` 为真，图传任务暂停推流，避免 AT 指令与 JPEG 帧争用 USART3；恢复成功上报 `LINK,UP`。
-- 遥测接口：`WIFI_GetLinkState()`、`WIFI_GetReconnectCount()`。
-
-### USART3 文本发送队列（`usart3.c` / `wifi_transfer.c`）
-
-- 原 `u3_printf()` 用 `vsprintf` 写 400B 固定缓冲（无边界检查）、逐字节 `while(TC==RESET)` 忙等，且图传 DMA 忙时直接丢报文。现改为：`vsnprintf` 有界格式化（192B）→ 768B 环形队列 → 128B 分块 DMA 发送；控制任务每 5ms、DMA 完成中断和每个视频分片结束都会 pump。
-- `USART3_DMA_TryStart()` 在关中断临界区内完成“判忙 + 启动”，文本队列与图传分片共用 DMA1_Stream3 时不会互相插入。
-- 图传改为 256B 分片包（`AA55A55A` + total/offset/len + CRC16）：文本队列非空时**不启动下一片**，因此 ACK 最坏等待约 2.6ms@921600；链路低于 460800 时直接跳过图传，优先保证控制。
-- `USART3_SendEscape()` 仅在队列为空且链路空闲时发出孤立的 `+++`；进入恢复前用 `USART3_TextDrain(500)` 有界排空，`LINK,DOWN`/最后一条 ACK 不再被 `TextFlush` 丢弃。
-- 队列满时丢弃并累加计数（`USART3_TextOverflow()`），`STATS` 中可见 `txov=`，不再无声出错。
-
-### USART3 接收：DMA circular + IDLE + 环形缓冲
-
-- RX 不再使用“每字节一次 RXNE 中断 + 400B 单缓冲”。`DMA1_Stream1` 以 circular 模式写入 512B 环形缓冲，USART IDLE 中断和 DMA HT/TC 中断把新增字节搬入现有 `USART3_RX_BUF`；TIM7 的 100ms 帧间隔仍负责置 `USART3_RX_STA[15]`，所有 AT 层调用点无需改写。
-- `USART3_RxReset()` 在清帧的同时把 DMA 读指针同步到当前写指针，避免把上一帧的残留字节带入下一帧。
-- 新增可观测计数：`USART3_GetRxOverflow()`（帧缓冲满丢弃字节）、`USART3_GetRxOre()`（ORE/DMA 传输错误）。921600 下不再依赖 CPU 逐字节搬运。
-- 注意：读取 IDLE 需读 SR 再读 DR，极端情况下可能与 DMA 争一个字节；这是 STM32 USART+DMA 的已知取舍，已通过环形缓冲与 CRC/长度校验兜底。
-
-### 控制环时序与抖动统计（`STATS`）
-
-原控制环并非 2ms：`Get_Adc_Average()` 每路 `delay_ms(5)`（3 路×2 次≈30ms）、HC-SR04 最坏阻塞 60ms、`MOTOR_LineTurnLeft/Right()` 每次阻塞 20ms。现改为：
-
-| 环节 | 旧实现 | 现实现 |
-| --- | --- | --- |
-| 循迹 ADC | 软件启动 + 5ms 延时平均 | TIM2 TRGO 1kHz 触发 ADC3 扫描 + DMA2_Stream0 circular，HT/TC 各平均 4 帧，读取零阻塞 |
-| 超声波 | 阻塞等回波，最坏 60ms | PF2 触发 + PF3 EXTI 双边沿 + DWT 时间戳，`HC_SR04_Poll()` 非阻塞，45ms 超时 |
-| 转向 | `MOTOR_LineTurnLeft/Right()` 内 `delay_ms(20)` | `CAR_StepSteer()` 比例差速 + `MOTOR_ForwardDual()`，无延时 |
-| 丢线搜索 | 原地阻塞转向 | `CAR_StepSearch()` pivot/settle 相位交替，状态机推进 |
-| 控制周期 | `vTaskDelayUntil(2ms)` 但常被阻塞拉长到几十 ms | `vTaskDelayUntil(5ms)`，单次循环只做非阻塞步骤 |
-
-DWT 统计在每次控制循环记录 `dt`（相邻循环起点差）和 `work`（循环体耗时），保留最近 128 次；上位机或串口发送 `STATS\r\n` 即返回：
-
-```
+```text
 STATS,dt50=<us>,dt99=<us>,dtmax=<us>,w50=<us>,w99=<us>,wmax=<us>,ovr=<n>,n=<cycles>,wdg=<n>,txov=<n>
 STATS2,vid_drop=<n>,rxov=<n>,ore=<n>
 ```
 
-| 指标 | 采集方式 | 设计/验收基线 | 台架实测 |
-| --- | --- | --- | --- |
-| 控制周期 p50 | `STATS` `dt50` | ≈5000µs | 待回填 |
-| 控制周期 p99 | `STATS` `dt99` | ≤5500µs | 待回填 |
-| 控制周期 max | `STATS` `dtmax` | ≤8000µs | 待回填 |
-| 循环体 p99 | `STATS` `w99` | ≤2000µs | 待回填 |
-| 7ms 周期超时次数 | `STATS` `ovr` | 持续运行 10min 为 0 | 待回填 |
+## 任务配送
 
-> 本轮在无硬件环境完成编译验证；上表“实测”列需在台架运行 `STATS` 后回填，避免写入未测量的数据。
+### 状态机
 
-### 协议幂等与 ACK 原因码
-
-- 上位机每条 `TASK_*/STOP` 命令自动追加 `,seq=<n>`；车端缓存最后一次 `cmd+task_id+seq` 的结果 30s。
-- 重发命中缓存时直接回放 `ACK,...,DUP,seq=<n>`，不再因 `TASK_START` 已进入 `NAV_TO_LOAD` 而回 `ACK,0` 被上位机标成“下发失败”。
-- 首次执行成功回 `OK`，非法字段回 `BADREQ`，任务忙回 `BUSY`，状态不允许回 `STATE`，未知命令回 `UNKNOWN`；Qt 日志会显示原因码。
-
-### 任务状态机加固（`car_app.c` / `wifi_cmd.c`）
-
-- **进站再武装（`armed`）**：进站触发后必须等三路循迹传感器全部离开黑带（出现白区）才允许下一次触发，避免停车点仍在黑带上时“刚出发就报到达”。
-- **丢线短超时（8s）**：循迹导航中连续全白 8s 即停车并上报 `STATUS,<task>,LINE_LOST`（进入 `TASK_LINE_LOST` 保持停止），非任务遥控循迹同样停车，不再原地搜索直到 5 分钟导航超时。
-- **协议解析加固（`wifi_cmd.c`）**：命令改为整词/前缀严格匹配（`wifi_cmd_is()`、`strncmp("TASK_START,", …)`），修正 `TASK_*` 参数指针偏移少 1 字节导致 `task_id` 为空的缺陷，字段为空即判为非法命令。
-
-## FreeRTOS 移植设计
-
-> 本文档原为独立文件 `RTOS_DESIGN_README.md`，已并入本 README。
-> 内核版本：**FreeRTOS Kernel V11.1.0**（FreeRTOSv202406.04-LTS，2024-04 发布），
-> 编译器：**ARMCC V5.06 update 4**，Keil MDK 工程 `USER\AIC_MedRobot.uvproj`。
-
-### 1. 总开关与条件编译机制
-
-所有 RTOS 相关代码统一由 **`RTOS\rtos_conf.h`** 中的宏控制：
-
-```c
-#define RTOS_ENABLE  1   // 1 = 启用 FreeRTOS；0 = 关闭（裸机大循环）
+```text
+TASK_IDLE
+  → NAV_TO_LOAD → APPROACH_LOAD → WAIT_LOAD
+  → NAV_TO_WARD → APPROACH_WARD → WAIT_UNLOAD
+  → TASK_IDLE
 ```
 
-- 切换后重新编译即可，**两种模式共用同一份工程、同一份硬件初始化代码**。
-- `RTOS_ENABLE` 通过 `sys.h` 引入 `rtos_conf.h` 后对全工程可见；`stm32f4xx_it.c`
-  单独 `#include "rtos_conf.h"`。
-- 条件编译的分支点：
-  - `main()`：`#if RTOS_ENABLE  RTOS_Start();  #else  CAR_LineFollow();`
-  - `CAR_LineFollow()`：内部仅裸机模式调用 `CAR_StepJpeg()/CAR_StepUi()`；
-    其余步骤函数两种模式共用。
-  - `delay.c`：RTOS 模式使用 DWT + `vTaskDelay` 延时（见第 6 节）。
-  - `stm32f4xx_it.c`：SVC/PendSV/SysTick 空实现仅在裸机模式编译。
-  - `FreeRTOSConfig.h`：栈溢出/内存失败钩子仅在 RTOS 模式启用，保证裸机模式
-    链接时内核不会被意外拖入固件。
+异常状态：`TASK_PAUSED`、`TASK_LINE_LOST`、`TASK_ABORTED`。
 
-> 构建验证：`RTOS_ENABLE=1` 与 `RTOS_ENABLE=0` 两种配置均编译通过
-> （0 Error / 0 Warning）。
+### 进站与停车
 
----
+- 三路循迹同时检测到黑带，并连续确认 4 个控制周期（5 ms/次，约 20 ms）后，
+  降速至 PWM 200 并上报 `ENTER_STATION`。
+- 进站触发后必须等待三路全部离开黑带（出现白区）才允许下一次触发。
+- 收到目标站点 `STOP` 后停车并上报 `TASK_ARRIVE`。
+- 2 s 未收到 `STOP` 时兜底停车，补发 `TASK_ARRIVE,<task>,<station>,FALLBACK`
+  并上报 `STATUS,TIMEOUT`。
 
-### 2. 新增/修改文件清单
+### 超时
 
-| 文件 | 类型 | 说明 |
-| --- | --- | --- |
-| `RTOS\rtos_conf.h` | 新增 | RTOS 总开关 `RTOS_ENABLE` |
-| `RTOS\FreeRTOSConfig.h` | 新增 | FreeRTOS 内核配置（堆、节拍、中断优先级等） |
-| `RTOS\rtos_app.c` | 新增 | RTOS 业务层：任务创建、调度入口、钩子、同步对象 |
-| `RTOS\rtos_app.h` | 新增 | RTOS 业务层接口（`RTOS_Start` 等） |
-| `SYSTEM\delay\delay.c` | 修改 | 增加 FreeRTOS 感知的 `delay_us/delay_ms`（DWT/`vTaskDelay`） |
-| `SYSTEM\sys\sys.h` | 修改 | 引入 `rtos_conf.h` |
-| `USER\main.c` | 修改 | 主循环拆分为步骤函数 + RTOS 主控任务 + 模式分支 |
-| `USER\stm32f4xx_it.c/h` | 修改 | SVC/PendSV/SysTick：裸机空实现 / RTOS 模式 `__asm` B 跳板 |
-| `CORE\startup_stm32f40_41xxx.s` | 修改 | 删除 3 个空向量桩，补 `IMPORT` 向量符号 |
-| `USER\AIC_MedRobot.uvproj` | 修改 | 新增 FreeRTOS 组（6 个文件）与 3 条包含路径 |
+| 场景 | 超时 | 行为 |
+| --- | ---: | --- |
+| 单段导航 | 5 min | 中止任务并上报 |
+| 装/卸确认 | 5 min | LED2 闪烁告警 |
+| 循迹连续全白 | 8 s | 停车并上报 `LINE_LOST` |
 
-FreeRTOS 内核源码（仅构建所需文件）位于 `RTOS\FreeRTOS-Kernel\`，**未做任何修改**，
-仅通过 `RTOS\FreeRTOSConfig.h` 配置；原 `FreeRTOSv202406.04-LTS\` 整包不再参与构建，可整体移除。
+### 人工确认
 
----
+上位机与车端触摸屏均可完成装/卸确认。车端控制页在等待确认时高亮
+“确认装药/确认取药”按钮，按下后等效发送 `TASK_CONFIRM`，WiFi 断开时仍可现场交接。
 
-### 3. 任务划分与优先级
+## 通信协议
 
-| 任务 | 函数 | 优先级 | 周期 | 栈(字) | 职责 |
-| --- | --- | --- | --- | --- | --- |
-| 主控任务 | `vTaskCarControl`（main.c） | 4（最高） | 5ms | 512 | 摄像头任务+遮挡检测、超声波测距+避障、ADC 采样、WiFi 命令执行、循迹/运动控制 |
-| WiFi 命令任务 | `vTaskWifi`（rtos_app.c） | 3 | 10ms | 256 | 轮询 USART3 接收状态，把原始命令字符串拷贝入队 |
-| JPEG 图传任务 | `vTaskJpeg`（rtos_app.c） | 3 | 5ms | 256 | 每次发送一个 256B 视频分片（带 total/offset/CRC），发完重启 DCMI |
-| UI 任务 | `vTaskUi`（rtos_app.c） | 1（最低） | 20ms | 384 | 触摸扫描、界面刷新、图像参数调节 |
-| 空闲任务 | 系统自带 | 0 | - | 128 | 内核空闲任务 |
+### TCP 连接
 
-设计要点：
+- 上位机作为 TCP 服务端，端口 **8086**；ESP8266 作为客户端接入。
+- 配网阶段 USART3 使用 **115200** 8N1；链路建立后可切换至 **921600** 发送图传。
+- 链路低于 **460800** 时车端跳过图传，仅保留控制与状态报文。
 
-- **主控任务保持最高优先级**，保证循迹/避障的实时性；它内部与裸机模式
-  完全相同的步骤顺序执行（见第 4 节）。
-- **电机只由主控任务驱动**。WiFi 任务只负责“读串口→入队”，不触碰电机，
-  避免两个任务并发写 PWM/GPIO 的竞态。
-- **JPEG 与 WiFi 同优先级（3）**，靠时间片轮转共享 CPU；JPEG 发送是 DMA
-  驱动、5ms 轮询一次，开销很小。
-- **UI 任务最低优先级**，可被随时抢占；触摸扫描、LCD 刷新这类“慢”操作
-  不再拖累运动控制。
+### 遥控命令
 
----
+每条命令以 `\r\n` 结尾；同一帧内的多条命令按行依次执行。
 
-### 4. 裸机主循环如何“原样”变成 RTOS 任务
+| 命令 | 功能 |
+| --- | --- |
+| `forWard` / `backWard` | 前进 / 后退 |
+| `lefTurn` / `righTurn` | 左转 / 右转 |
+| `letStop` | 停止 |
+| `speedUp` / `speedDown` | PWM ±50，范围 50~500 |
+| `startTask` / `stopTask` | 使能 / 停止循迹 |
+| `STATS` | 输出控制与链路统计 |
 
-原 `CAR_LineFollow()` 是一个 `while(1)` 大循环。为兼顾“尽量不改动原有函数”
-与“多任务并行”，将其循环体按职责拆成 7 个**步骤函数**（均在 `main.c`），
-每个步骤内部的逻辑、顺序、局部变量含义与原循环逐行对应：
+### 任务命令
 
-```
-CAR_StepWifi   ->  WiFi 命令检查（裸机直读串口 / RTOS 从队列取命令）
-CAR_StepJpeg   ->  JPEG 帧处理与发送（仅裸机；RTOS 由 vTaskJpeg 承担）
-CAR_StepUi     ->  UI_Task（仅裸机；RTOS 由 vTaskUi 承担）
-CAR_StepCamera ->  CAMERA_Task + 遮挡检测（含 LCD 互斥）
-CAR_StepRange  ->  超声波测距 + 避障逻辑（含 LCD 互斥）
-CAR_StepAdc    ->  ADC 采样 + LED 心跳 + 数据页刷新（循迹值/状态/速度）
-CAR_StepMotion ->  避障/遮挡/遥控暂停 -> 起步加速 -> 循迹逻辑
+| 命令 | 功能 |
+| --- | --- |
+| `TASK_START,<task_id>,<from>,<to>[,seq=<n>]` | 创建并启动任务 |
+| `STOP,<task_id>,<station_id>[,seq=<n>]` | 目标站点停车 |
+| `TASK_CONFIRM,<task_id>,<load\|unload>,<user>[,seq=<n>]` | 装药 / 取药确认 |
+| `TASK_PAUSE,<task_id>[,seq=<n>]` | 暂停 |
+| `TASK_RESUME,<task_id>[,seq=<n>]` | 恢复 |
+| `TASK_CANCEL,<task_id>[,seq=<n>]` | 取消并回到 IDLE |
+
+### ACK 与幂等
+
+所有任务命令返回：
+
+```text
+ACK,<task_id>,<0|1>,<reason>,seq=<n>
 ```
 
-- 裸机模式：`CAR_LineFollow()` 按原顺序调用全部步骤，行为与原来一致。
-- RTOS 模式：`vTaskCarControl` 以 5ms 周期调用除 UI/JPEG 外的步骤；
-  UI、JPEG、WiFi 由各自任务并行执行。
-- 驱动接口保留原名称；ADC 改为 `Adc_ReadLine()`、超声波改为 `HC_SR04_Start/Poll()`、
-  控制环改用 `CAR_StepSteer/Search()`，其余调用点保持兼容。
+`reason`：`OK / DUP / BUSY / STATE / BADREQ / UNKNOWN`。
 
----
+- 上位机 500 ms 未收到 ACK 自动重发，最多 3 次。
+- 车端缓存最近一次 `cmd + task_id + seq` 的结果 30 s；重复命令直接回放 `DUP`。
+- 命令解析使用整词/前缀匹配并校验字段，空字段或缺字段返回 `BADREQ`。
 
-### 5. 任务间通信与同步
+### 上行状态
 
-### 5.1 WiFi 命令队列（生产者-消费者）
+| 报文 | 说明 |
+| --- | --- |
+| `ACK,<task_id>,<0|1>,<reason>,seq=<n>` | 下行命令确认 |
+| `ENTER_STATION,<task_id>,<seq>` | 检测到进站黑带，请求开启识别窗口 |
+| `STATUS,<task_id>,<state>` | 任务状态：NAV/APPROACH/STOPPED/WAIT_LOAD/WAIT_UNLOAD/PAUSED/TIMEOUT/CANCELLED |
+| `TASK_ARRIVE,<task_id>,<station_id>[,FALLBACK]` | 已停稳，等待人工确认 |
+| `TASK_DONE,<task_id>` | 取药确认完成 |
+| `HEARTBEAT,<battery>,<state>` | 1 s 心跳 |
 
-```c
-typedef struct { char cmd[64]; } WiFiCmdMsg;   // RTOS/rtos_app.h
+### 视频分片
+
+```text
+AA 55 A5 5A | total(2B LE) | offset(2B LE) | len(2B LE) | payload(len B) | CRC16(2B LE)
 ```
 
-- `vTaskWifi`：`atk_8266_at_response_rdCmd(1)` 读到命令后拷贝成 64 字节
-  消息 `xQueueSend` 入队（队列深 4，满则丢弃——遥控命令不积压，保证最新
-  命令尽快生效）。
-- `vTaskCarControl`：每周期 `RTOS_WifiCmdReceive()` 非阻塞出队，调用
-  `wifi_dispatch_commands()` 拆分后逐条调用原 `handle_wifi_command()` 解析并驱动电机。
-- 好处：电机唯一写者；主控任务无需等待串口；命令解析逻辑 100% 复用原函数。
+- `payload` 最大 256 B，CRC16-CCITT 覆盖本片数据，上位机按 `offset` 重组。
+- 文本行与视频分片共用 TCP 连接；文本队列优先于下一片视频启动。
+- 上位机兼容旧格式 `AA55 + len32 + JPEG + CRC16`。
 
-### 5.2 任务控制命令与循迹使能（上位机联动）
+## 触摸屏 UI
 
-- 上位机每条命令以 `\r\n` 结尾；MCU 侧 `wifi_dispatch_commands()` 用 `strtok`
-  按行拆分，解决快速按键（按下/松开间隔 < 100ms）时多条命令合并成一帧、
-  旧逻辑只执行第一条导致小车不停的问题。
-- 新增两条任务命令（裸机/RTOS 共用同一解析入口）：
-  - `startTask`：置 `line_enabled = 1`，使能循迹（上位机"添加配送任务 /
-    呼叫小车 / 返回充电"时发送）。
-  - `stopTask`：置 `line_enabled = 0` 并 `MOTOR_Stop()`（上位机"暂停 / 取消 /
-    手动控制"时发送）。
-- `CAR_StepMotion()` 增加门控：`line_enabled == 0` 时小车保持静止，
-  不进入起步/循迹流程；遥控命令（`forWard` 等）仍可经 `wifi_override`
-  临时驱动，500ms 覆盖窗口结束后回到静止或循迹。
-- 小车初始 `line_enabled = 0`：上电后不自动循迹，等待上位机任务指令。
+| 页面 | 内容 |
+| --- | --- |
+| 控制 | 装药/取药确认按钮 |
+| 数据 | 三路循迹 ADC 原始值、运动状态、PWM 速度 |
+| 网络 | WiFi 名称、本机 IP、服务器 IP/端口、在线状态 |
 
-### 5.3 图传波特率（临时提速）
+字库为 16×16 中文点阵，覆盖界面所需汉字。
 
-- 初始化仍按 `usart3_init(115200)` 标准波特率配网。
-- TCP 连接建立后、进入透传前发送 `AT+UART_DEF=921600,8,1,0,0`，
-  成功后用 `usart3_set_baudrate(921600)` 重配 USART3（仅改 BRR，不动
-  `USART3_RX_STA`/TIM7/DMA），提高 JPEG 图传帧率。
-- 若模块固件不支持 `AT+UART_DEF`，保持 115200 继续，功能不受影响。
-- 网络参数（SSID/密码/服务器 IP/端口/图传波特率）集中在
-  `HARDWARE/ATK-ESP8266/wifi_config.h`，不再使用 `common.c` 中的旧硬编码变量。
-- 配网成功（CWJAP 应答 `WIFI GOT IP`）后、进入透传模式前发送 `AT+CIFSR`
-  查询并缓存 STA 本机 IP（`wifista.c` 的 `atk_8266_query_local_ip()`），
-  供 UI 网络页面只读显示；透传模式下不再发送 AT 指令。
+## 可靠性设计
 
-### 5.4 LCD 访问互斥（互斥量，带优先级继承）
+### 看门狗
 
-UI 任务与主控任务都会写屏（`UI_Task` 与 `UI_SetDistance/UI_SetObstacle/
-CAMERA_Task`），为防止两任务交叉写 FSMC 造成显示撕裂，LCD 访问统一经：
+- IWDG 在 LCD、ADC、USART、摄像头初始化前启动，LSI 约 32 kHz、32 分频、
+  重载 1600，超时约 1.6 s。
+- 看门狗时基独立于 TIM6：RTOS 使用 `xTaskGetTickCount()`，裸机使用 DWT。
+- 控制、WiFi、图传、UI 四个任务分别递增 progress 计数并记录时间戳；控制任务
+  每 200 ms 调用 `WDG_CheckAndFeed()`，只有四个任务均在 1.2 s 内前进才喂狗。
+- `WDG_GetMissed()` 统计未通过的检查次数，`STATS` 通过 `wdg=` 输出。
 
-```c
-RTOS_LcdLock();   // xSemaphoreTake(xLcdMutex, portMAX_DELAY)
-...LCD 操作...
-RTOS_LcdUnlock(); // xSemaphoreGive(xLcdMutex)
-```
+### 启动与链路
 
-裸机模式下 `RTOS_LcdLock/Unlock` 定义为空操作（`rtos_app.h`），调用点统一。
+- WiFi 配网、AT 等待与 TCP 连接均有次数/时间上限。
+- 设备离线时进入重连退避，链路恢复后重新建立 TCP 连接。
+- 调度器启动前的 AT 等待只更新启动进度；调度器运行后，AT 等待只更新 WiFi 任务进度，
+  不直接喂狗。
 
-### 5.5 共享状态与原子性
+### 串口与队列
 
-- `jpeg_data_ok / jpeg_data_len / jpeg_last_frame_bytes`：由 DCMI 中断写、
-  JPEG 任务读；32 位读写是 Cortex-M4 的原子操作，无需加锁。
-- `adcL/adcM/adcR`：仅主控任务读写；UI 通过 `UI_SetLineSensors()` 接收副本用于数据页显示。
-- `UI_GetPage()` 返回的页面号：UI 任务写、主控任务读，单字节原子，允许
-  轻微滞后（仅影响画面裁剪判断），可接受。
+- USART3 接收使用 DMA circular + IDLE 中断 + 环形缓冲，不使用逐字节 RXNE 中断。
+- 文本发送使用有界队列，`u3_printf()` 通过 `vsnprintf` 限制长度。
+- 视频发送前检查文本队列；DMA 完成中断会立即尝试发送待发文本，降低 ACK 等待。
 
----
+### 协议与状态机
 
-### 6. 延时函数改造（关键点）
+- `seq` 幂等键覆盖上位机重发，30 s 内回放上次 ACK。
+- 进站触发带“离带再武装”，避免停车点仍在黑带上时重复触发。
+- 丢线 8 s 停车并上报，不等待 5 min 导航超时。
+- 兜底停车仍上报 `TASK_ARRIVE`，上位机可走人工确认流程。
 
-原 `delay_us/delay_ms` 用 SysTick 忙等。FreeRTOS 启动后 **SysTick 归内核
-独占**（节拍中断），若任务里再用 SysTick 忙等会改写 `LOAD` 并关闭计数器，
-直接破坏系统节拍。因此 `SYSTEM\delay\delay.c` 增加 RTOS 分支：
+## FreeRTOS 设计
 
-- `delay_us()`：改用 **DWT 周期计数器**（`DWT->CYCCNT`）忙等，不碰 SysTick，
-  可在任务/初始化阶段安全使用；`delay_init(168)` 时完成 DWT 使能。
-- `delay_ms()`：调度器运行后调用 `vTaskDelay()` **主动让出 CPU**；
-  调度器未启动时退化为 DWT 忙等（初始化阶段可用）。
-- 原裸机 SysTick 忙等路径（含 `delay_xms`）在 `#if !RTOS_ENABLE` 下原样保留，
-  裸机行为不受影响。
-- `MOTOR_LineTurnLeft/Right`（内含 `delay_ms(20)`）、`HC_SR04_GetDistance`
-  （内含约 30ms `delay_us` 忙等）等“慢”调用在主控任务里会阻塞该任务
-  一小段时间，但**不会阻塞其他任务**——这正是 RTOS 并行的收益。
+### 内核配置
 
----
+| 项目 | 值 |
+| --- | --- |
+| 内核版本 | FreeRTOS Kernel V11.1.0 |
+| 编译器 | ARMCC V5.06 update 4 |
+| 节拍 | 1000 Hz |
+| 堆 | `configTOTAL_HEAP_SIZE = 10 KB`，heap_4 |
+| 中断优先级位 | 4 |
+| 可调用 FreeRTOS API 的 ISR 下限 | `0x50` |
 
-### 7. 中断向量处理（移植层关键）
+### 任务间通信
 
-FreeRTOS RVDS/ARM_CM4F 移植层（`portable\RVDS\ARM_CM4F\port.c`）提供的
-中断入口名是 `vPortSVCHandler / xPortPendSVHandler / xPortSysTickHandler`，
-而工程启动文件向量表使用 `SVC_Handler / PendSV_Handler / SysTick_Handler`。
+- **WiFi 命令队列**：深度 4、每项 64 B；满时丢弃新命令，避免遥控积压。
+- **LCD 互斥量**：带优先级继承；UI 与控制任务的所有 LCD 操作统一加锁。
+- **共享状态**：32 位 JPEG 标志由中断写、任务读，Cortex-M4 上原子；ADC 值仅控制任务读写。
 
-ARMCC V5 不支持跨编译单元的 `alias`，且 PendSV 的上下文切换依赖异常入口时
-`r14 = EXC_RETURN` 的语义，不能套 C 包装函数。因此把三个向量直接定义在
-**始终参与编译**的 `USER\stm32f4xx_it.c` 中，RTOS 模式用 `__asm` 内联汇编
-写 `B` 跳板（`B` 不触碰 `r14`，与向量表直连等价）：
+### 延时与中断向量
 
-```c
-__asm void PendSV_Handler(void)
-{
-    IMPORT xPortPendSVHandler
-    B      xPortPendSVHandler
-}
-```
+- `delay_us()` 使用 DWT 周期计数器，不占用 SysTick。
+- `delay_ms()` 在调度器运行后调用 `vTaskDelay()`；调度器未启动时使用 DWT 忙等。
+- SVC/PendSV/SysTick 向量在 `stm32f4xx_it.c` 中用 `B` 跳板转发到 FreeRTOS 移植层，
+  保留 `EXC_RETURN` 语义。
 
-- `B` 跳转不改写 `r14`，与向量表直连完全等价，保证 PendSV 正确保存/恢复
-  `EXC_RETURN`。
-- 三个向量定义在 `stm32f4xx_it.c`（USER 组，始终编译），不依赖 RTOS 组里
-  是否有额外的汇编文件；裸机模式（`RTOS_ENABLE=0`）编译为空实现，内核不会
-  被链接进固件（RAM 零开销）。
-- 启动文件同步修改：删除 SVC/PendSV/SysTick 三个空向量桩并补 `IMPORT`。
-
----
-
-### 8. 内存分配与预算
-
-`configTOTAL_HEAP_SIZE = 10KB`（heap_4，支持碎片合并），任务栈、TCB、
-队列、互斥量全部从堆分配：
+### 内存预算
 
 | 占用项 | 大小 |
-| --- | --- |
-| 主控任务栈 | 2KB |
-| UI 任务栈 | 1.5KB |
-| WiFi / JPEG 任务栈 | 各 1KB |
-| 空闲任务栈 | 0.5KB |
-| TCB（5 个）+ 队列 + 互斥量 | ≈1KB |
-| 合计 | ≈7KB，堆内剩余 ≈3KB 余量 |
+| --- | ---: |
+| 控制任务栈 | 2 KB |
+| UI 任务栈 | 1.5 KB |
+| WiFi / JPEG 任务栈 | 各 1 KB |
+| 空闲任务栈 | 0.5 KB |
+| TCB、队列、互斥量 | 约 1 KB |
+| 合计 | 约 7 KB，堆内剩余约 3 KB |
 
-链接结果（RTOS 模式）：`Code=80.5KB / RO=9KB / RW=0.4KB / ZI=119KB`，
-总 SRAM 128KB，剩余约 7.5KB（含 MSP 栈区），Flash 远小于 1MB。
-裸机模式：`Code=65.3KB / ZI=108.8KB`，与移植前基本一致（内核未链接）。
+### 钩子
 
-> 大数组 `camera_frame[140][236]`（66KB，RGB565）与 `jpeg_buf[10240]`
-> （40KB）仍在原位置，未动内存布局。
+- `vApplicationMallocFailedHook()`：堆耗尽时点亮 LED2 并停机。
+- `vApplicationStackOverflowHook()`：任务栈溢出时点亮 LED2 并停机。
+- LED2 常亮表示堆/栈配置异常，优先检查任务栈与 `configTOTAL_HEAP_SIZE`。
 
----
+## 构建与烧录
 
-### 9. 中断优先级配置
+1. 用 Keil µVision 打开 `USER/AIC_MedRobot.uvproj`。
+2. 选择芯片 **STM32F407ZGT6**。
+3. 在 `RTOS/rtos_conf.h` 设置 `RTOS_ENABLE`。
+4. Build 生成 `OBJ/AIC_MedRobot.hex`。
+5. 使用 J-Link / ST-Link 烧录。
 
-`FreeRTOSConfig.h` 关键配置：
+## 当前限制
 
-```c
-#define configCPU_CLOCK_HZ       168000000UL
-#define configTICK_RATE_HZ       1000
-#define configPRIO_BITS          4
-#define configMAX_SYSCALL_INTERRUPT_PRIORITY  (5 << (8-4))   // 0x50
-#define configKERNEL_INTERRUPT_PRIORITY       (15 << (8-4))  // 0xF0
-```
+- 图传帧率受 USART3 带宽限制；提高帧率需要更高链路带宽或更低 JPEG 体积。
+- USART2 为预留初始化，当前未使用。
+- 心跳电量暂为固定值 100，尚未接入电池电压采样。
+- 站点 ID 为编译期常量，现场调整需要重新编译。
+- 上行文本行以 `\r\n` 分帧，尚未增加行级 CRC。
+- `STATS` 的分位数需要在台架运行后记录，作为控制抖动基线。
 
-- STM32F407 实现 4 位中断优先级；`0x50` 是“可调用 FreeRTOS API 的 ISR
-  优先级下限”，本项目 ISR 均不调用 FreeRTOS API，因此全部外设中断都高于
-  该阈值也不会触发断言。
-- 工程沿用 `NVIC_PriorityGroup_2`（`EXTIX_Init` 设置），经 port.c 断言
-  （`ulMaxPRIGROUPValue = (7-4)<<8 = 0x300`，Group2 的 AIRCR=0x200）验证通过，
-  **无需改优先级分组**。
-- 系统节拍由 SysTick 产生（1ms）；应用时间基准 `EXTIX_GetMillis()`（TIM6，
-  1ms 中断）与 SysTick 并存，互不干扰。
+## 相关文档
 
----
-
-### 10. 钩子与错误处理
-
-- `vApplicationMallocFailedHook()`：堆耗尽 → 点亮 LED2 并停机。
-- `vApplicationStackOverflowHook()`：任务栈溢出（`configCHECK_FOR_STACK_OVERFLOW=2`）
-  → 点亮 LED2 并停机。
-- 调试建议：若上电后 LED2 常亮，说明堆/栈配置不足，优先检查第 8 节预算。
-
----
-
-### 11. 已知限制与注意事项
-
-1. **`delay_ms` 与任务节拍**：RTOS 模式下 `delay_ms` 在调度器运行后转为
-   `vTaskDelay`，因此不能再在 ISR 中调用（本项目所有 ISR 均未调用）。
-2. **主控任务内的“慢”调用**：`MOTOR_LineTurnLeft/Right` 内的 `delay_ms(20)`
-   会短暂阻塞主控任务（其他任务照常运行）；若需要更精细的转向控制，可把
-   转向改为状态机（当前保留原实现，符合“不改动原有函数”的约束）。
-3. **I2C 时序**：`delay_us` 忙等可能被 1ms 节拍抢占，I2C（SCCB/触摸）时序
-   会变慢但不会出错（I2C 无最小时钟频率要求）。
-4. **UI 页面号跨任务读取**：允许短暂滞后，仅影响摄像头裁剪显示判断。
-5. **UCOS 与 FreeRTOS 互斥**：`SYSTEM_SUPPORT_UCOS` 与 `RTOS_ENABLE`
-   不应同时为 1（`delay.c` 的取舍按此假设）。
-6. **堆大小调节**：若新增任务/功能，先估算栈需求，再在
-   `FreeRTOSConfig.h` 调整 `configTOTAL_HEAP_SIZE`，注意 RAM 上限 128KB。
-
----
-
-### 12. 如何切换与验证
-
-1. 修改 `RTOS\rtos_conf.h` 中 `RTOS_ENABLE` 为 1 或 0。
-2. 用 Keil 打开 `USER\AIC_MedRobot.uvproj` 重新编译下载。
-3. RTOS 模式运行表现：小车行为与裸机一致，但超声波测距的 30ms 等待期间
-   UI/图传/WiFi 依然流畅运行；LED2 常亮表示堆/栈异常。
-
----
-
-## 编译与烧录
-
-1. 打开 `USER/AIC_MedRobot.uvproj`（Keil µVision）
-2. 选择芯片：**STM32F407ZGT6**
-3. 点击 **Build** (F7) 编译
-4. 生成 `OBJ/AIC_MedRobot.hex`，使用 J-Link / ST-Link 烧录
-
----
-
-*文档版本: 1.4 | 最后更新: 2026-10-04 | 新增看门狗、WiFi 链路自愈、USART3 文本发送队列与任务状态机加固*
+- 仓库总览与系统架构：`../README.md`
+- 测试计划与执行记录：`../TESTING.md`
+- 测试实现与扩展方法：`../tests/README.md`
