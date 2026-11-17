@@ -76,12 +76,20 @@ def strip_c_comments(text: str) -> str:
 
 
 def c_function(text: str, name: str, include_signature: bool = True) -> str:
-    """Return a C function definition (signature + body) by name."""
+    """Return a C function definition (return type + signature + body) by name."""
     pattern = r"\b" + re.escape(name) + r"\s*\([^;{}]*\)\s*\{"
     match = re.search(pattern, text)
     if not match:
         raise AssertionError("C function not found: " + name)
-    start = match.start()
+
+    # Include the return type (for example ``uint16_t``) so extracted code is
+    # valid C99. Function definitions in this project are written on one line.
+    line_start = text.rfind("\n", 0, match.start()) + 1
+    prefix = text[line_start:match.start()]
+    if any(token in prefix for token in (";", "{", "}", "//", "/*", "#")):
+        start = match.start()
+    else:
+        start = line_start
     brace = match.end() - 1
     depth = 0
     for i in range(brace, len(text)):

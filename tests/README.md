@@ -60,7 +60,8 @@ CI 不构建 Keil 工程；目标板编译在本地 Keil MDK 中完成。
 
 `tests/host/test_car_state.c` 在包含 `car_app.c` 前临时将 `static` 定义为空，
 从而直接调用 `CAR_StepTask()`、`CAR_OnTaskCommand()` 等函数并检查真实全局状态。
-源文件本身不改写。
+`car_app.c` 为 GBK 编码，测试在临时目录将其转码为 UTF-8 后编译，避免混合编码
+翻译单元；仓库源文件本身不改写。
 
 硬件边界由桩提供：
 

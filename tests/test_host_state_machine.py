@@ -15,6 +15,7 @@ from common import FW, REPO
 from toolchain import Builder, find_toolchain, run_exe
 
 INCLUDE_DIRS = [
+    REPO / "tests/host",
     REPO / "tests/host/stubs",
     FW / "USER",
     FW / "RTOS",
@@ -44,11 +45,24 @@ class HostStateMachineTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="aic-state-") as tmp:
             work = Path(tmp)
             builder = Builder(self.tc, work)
+
+            # car_app.c is GBK, while the test harness and headers are UTF-8.
+            # Transcode a temporary copy so GCC never has to parse a mixed-
+            # encoding translation unit. The repository source is untouched.
+            car_source = (FW / "USER/car_app.c").read_text(encoding="gbk")
+            (work / "car_app_utf8.c").write_text(car_source, encoding="utf-8")
+            harness = (REPO / "tests/host/test_car_state.c").read_text(encoding="utf-8")
+            marker = '#include "car_app.c"'
+            self.assertIn(marker, harness)
+            harness = harness.replace(marker, '#include "car_app_utf8.c"')
+            harness_path = work / "test_car_state_utf8.c"
+            harness_path.write_text(harness, encoding="utf-8")
+
             test_obj = builder.compile(
-                REPO / "tests/host/test_car_state.c",
+                harness_path,
                 work / "test_car_state.obj",
-                includes=INCLUDE_DIRS,
-                charset=".936",
+                includes=[work] + INCLUDE_DIRS,
+                charset=".65001",
             )
             wifi_obj = builder.compile(
                 FW / "USER/wifi_cmd.c",
