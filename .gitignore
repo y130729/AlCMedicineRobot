@@ -8,3 +8,7 @@ build-*/
 # 系统/编辑器杂项
 Thumbs.db
 .DS_Store
+
+# Python 测试缓存
+__pycache__/
+*.py[cod]
